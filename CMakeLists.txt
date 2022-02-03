@@ -14,15 +14,12 @@ MESSAGE(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
 LIST(APPEND CMAKE_MODULE_PATH "${LLVM_CMAKE_DIR}")
 
-include(LLVM-Config)
-include(HandleLLVMOptions)
-include(AddLLVM)
+INCLUDE(LLVM-Config)
+INCLUDE(HandleLLVMOptions)
+INCLUDE(AddLLVM)
 
 INCLUDE_DIRECTORIES(${LLVM_INCLUDE_DIRS})
 
-add_llvm_library(SwapAddLLVMPass MODULE
-    SwapAdd.cpp
-
-    PLUGIN_TOOL opt
-    )
+ADD_SUBDIRECTORY(SwapAdd)
+ADD_SUBDIRECTORY(SROA)
 
