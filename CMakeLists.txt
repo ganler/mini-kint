@@ -6,7 +6,8 @@ SET(CMAKE_CXX_STANDARD 17)
 SET(CMAKE_C_COMPILER "clang")
 SET(CMAKE_CXX_COMPILER "clang++")
 
-FIND_PACKAGE(LLVM REQUIRED CONFIG)
+# wget https://github.com/llvm/llvm-project/releases/download/llvmorg-8.0.1/clang+llvm-8.0.1-powerpc64le-linux-ubuntu-16.04.tar.xz
+FIND_PACKAGE(LLVM REQUIRED CONFIG HINTS "/home/ganler/Documents/CS526/clang+llvm-8.0.1-powerpc64le-linux-ubuntu-16.04/lib/cmake")
 
 MESSAGE(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 MESSAGE(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
