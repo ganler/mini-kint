@@ -20,7 +20,10 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "scalarrepl"
+
 #include <iostream>
+
+#include "llvm/Support/Casting.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -30,6 +33,7 @@
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/ADT/Statistic.h"
+
 using namespace llvm;
 
 STATISTIC(NumReplaced,  "Number of aggregate allocas broken up");
@@ -55,8 +59,8 @@ namespace {
 }
 
 char SROA::ID = 0;
-static RegisterPass<SROA> X("scalarrepl-netid",
-			    "Scalar Replacement of Aggregates (by <netid>)",
+static RegisterPass<SROA> X("scalarrepl-jiawei6",
+			    "Scalar Replacement of Aggregates (by jiawei6)",
 			    false /* does not modify the CFG */,
 			    false /* transformation, not just analysis */);
 
@@ -69,10 +73,50 @@ FunctionPass *createMyScalarReplAggregatesPass() { return new SROA(); }
 //===----------------------------------------------------------------------===//
 //                      SKELETON FUNCTION TO BE IMPLEMENTED
 //===----------------------------------------------------------------------===//
+
+// Implementation notes:
+// -> mem2reg to promote scalar allocas;
+// -> sroa to replace struct allocas with scalar allocas;
+
+// HINT: `PromoteMemToReg(AllocaVec, DominatorTree, AliasSetTracker)` ~ mem2reg
+//           requires all the AllocaInst instructions in AllocaVec must be promotable (`isAllocaPromotable(c AllocaInst*)`).
+
+namespace jiawei6 {
+
+// TASK: Implement `isAllocaPromotable`:        
+bool isAllocaPromotable(const llvm::AllocaInst* inst) {
+  // R1: isFPOrFPVectorTy() || isIntOrIntVectorTy() || isPtrOrPtrVectorTy()
+  if (!(inst->getAllocatedType()->isFPOrFPVectorTy() ||
+        inst->getAllocatedType()->isIntOrIntVectorTy() ||
+        inst->getAllocatedType()->isPtrOrPtrVectorTy()))
+    return false;
+
+  // R2: only used in a load/store instruction that !isVolatile()
+  for (const auto&& user : inst->users()) {
+    const auto load_inst = dyn_cast<LoadInst>(user);
+    const auto store_inst = dyn_cast<StoreInst>(user);
+
+    if ( ! ((load_inst && load_inst->isVolatile()) || (store_inst && store_inst->isVolatile())) ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+}
+
 //
 // Function runOnFunction:
 // Entry point for the overall ScalarReplAggregates function pass.
 // This function is provided to you.
+
+// TODO(JIAWEI): 
+// TASK: Implement `SROA`:
+//           S1: only consider alloca instructions;
+//           S2: alloca can be eliminated if:
+//                   U1: `getelementptr` that "getelementpre ptr, 0, constant[, ... constant]"
+//                                       that result is only used in instructions of type U1 or U2 or as the pointer argument of load/store;
 bool SROA::runOnFunction(Function &F) {
 
   bool Changed = false;
