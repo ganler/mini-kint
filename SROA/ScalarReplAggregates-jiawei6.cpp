@@ -20,6 +20,8 @@
 //===----------------------------------------------------------------------===//
 
 
+#include "llvm/IR/Constant.h"
+#include "llvm/IR/Value.h"
 #define DEBUG_TYPE "scalarrepl"
 
 #include <iostream>
@@ -59,6 +61,7 @@ namespace {
 
   private:
     // Add fields and helper functions for this pass here.
+    bool isGetElementPtrSafeByUser(Function& F, const GetElementPtrInst* geptr_inst) const noexcept;
   };
 }
 
@@ -162,15 +165,55 @@ bool SROA::runOnFunction(Function &F) {
   bool sora_changed = scalar_promotion();
 
   while(true) {
-    bool sora_changed = [this]{
-      // TODO(JIAWEI): IMPL SROA.
-      return false;
-    }();
-
-    cfg_changed |= sora_changed;
-
     // quit until no more changes.
-    if (!sora_changed)
+    if (![&F, this]{
+      std::vector<AllocaInst*> alloca_worklist{};
+      auto&& bb = F.getEntryBlock();
+
+      for (auto&& inst : bb) {
+        if (auto alloca_inst = dyn_cast<AllocaInst>(&inst)) {
+          alloca_worklist.push_back(alloca_inst);
+        }
+
+        while (!alloca_worklist.empty()) {
+          // start from the last element for best performance.
+          auto&& alloca = alloca_worklist.back();
+          alloca_worklist.pop_back();
+
+          // now we have eliminated scala allocas (isAllocaPromotable).
+          // but there still can be: array, struct, heap object, etc...
+
+          // we first only consider struct
+          // TODO(BONUS): handle array;
+          if (auto struct_alloca = dyn_cast<AllocaInst>(alloca)) {
+            if (![this, &F, struct_alloca]{
+
+              for (auto&& user : struct_alloca->users()) {
+                // U1: getelementptr;
+                if (const auto geptr_inst = dyn_cast<GetElementPtrInst>(user)) {
+                    if (!isGetElementPtrSafeByUser(F, geptr_inst))
+                      return false;
+                // U2: `eq` / `ne` against nullptr;
+                } else if (const auto cmp_inst = dyn_cast<ICmpInst>(user)) {
+                  if (cmp_inst->getPredicate() == ICmpInst::ICMP_EQ || cmp_inst->getPredicate() == ICmpInst::ICMP_NE) {
+                    if (!dyn_cast<ConstantPointerNull>(cmp_inst->getOperand(0)) && !dyn_cast<ConstantPointerNull>(cmp_inst->getOperand(1)))
+                      return false;
+                  }
+                }
+              }
+
+              return true;
+            }()) { // * Is it safe to promote it? Skip it if unsafe.
+              continue;
+            }
+          }
+
+          // TODO(JIAWEI): Impl alloca replacement in SROA.
+        }
+      }
+
+      return false;
+    }())
       break;
     
     cfg_changed = true;
@@ -183,3 +226,38 @@ bool SROA::runOnFunction(Function &F) {
   return cfg_changed;
 }
 
+// It is safe to replace original struct ptrs with a few scalars iff the struct ptr has not needed after replacement.
+// That said, if all uses are simply 1) value read/write; and/or 2) nullptr comparison; (or even >, < but more complicated);
+bool SROA::isGetElementPtrSafeByUser(Function& F, const GetElementPtrInst* geptr_inst) const noexcept {
+  // U1.1: getelementptr ptr,    0, constant[, ... constant]
+  //                     ptr, this, const access;
+  bool is_safe_u11 = geptr_inst->getNumOperands() >= 3                                 /* >2 operands */ && \
+    geptr_inst->getOperand(1) == ConstantInt::get(Type::getInt32Ty(F.getContext()), 0) /* "0"         */ && \
+    [geptr_inst]{                                                                      /* "constant"  */
+      for (size_t i = 2; i < geptr_inst->getNumOperands(); ++i)
+        if (!isa<ConstantInt>(geptr_inst->getOperand(i)))
+          return false;
+      return true;
+    }();
+  
+  if (!is_safe_u11)
+    return false;
+
+  // U1.2: result value only used by U1 or U2; 
+  for (auto&& geptr_user : geptr_inst->users()) {
+    // U1.2.1: argument in load/store;
+    if (const auto load_inst = dyn_cast<LoadInst>(geptr_user)) {
+      if (load_inst->getPointerOperand() != geptr_inst)
+        return false;
+    } else if (const auto store_inst = dyn_cast<StoreInst>(geptr_user)) {
+      if (store_inst->getPointerOperand() != geptr_inst)
+        return false;
+    } else if (const auto user_geptr_inst = dyn_cast<GetElementPtrInst>(geptr_user)) {
+      // U1.2.2: argument in getelementptr;
+      if (!isGetElementPtrSafeByUser(F, user_geptr_inst))
+        false;
+    }
+  }
+
+  return true;
+}
