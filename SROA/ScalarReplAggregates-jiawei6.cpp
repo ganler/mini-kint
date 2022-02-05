@@ -21,7 +21,9 @@
 
 
 #include "llvm/IR/Constant.h"
+#include "llvm/IR/Constants.h"
 #include "llvm/IR/Value.h"
+#include <cstddef>
 #define DEBUG_TYPE "scalarrepl"
 
 #include <iostream>
@@ -162,11 +164,12 @@ bool SROA::runOnFunction(Function &F) {
   };
 
   // Step 2: replace aggregate allocas with scalar allocas (sroa)
-  bool sora_changed = scalar_promotion();
+  cfg_changed = scalar_promotion();
 
   while(true) {
     // quit until no more changes.
     if (![&F, this]{
+      bool repl_changed = false;
       std::vector<AllocaInst*> alloca_worklist{};
       auto&& bb = F.getEntryBlock();
 
@@ -206,13 +209,62 @@ bool SROA::runOnFunction(Function &F) {
             }()) { // * Is it safe to promote it? Skip it if unsafe.
               continue;
             }
-          }
 
-          // TODO(JIAWEI): Impl alloca replacement in SROA.
+            // struct alloca safe to be replaced now now;
+            // TODO(JIAWEI): Impl alloca replacement in SROA.
+            // S1: get alloca inst for sub fields;
+            std::vector<AllocaInst*> sub_alloca_fields{};
+            if(auto struct_alloca_types = struct_alloca->getAllocatedType()) {
+              sub_alloca_fields.reserve(struct_alloca_types->getNumContainedTypes()); // optimization.
+              for (size_t i = 0; i < struct_alloca_types->getNumContainedTypes(); ++i) {
+                //                                 type, addr_space, name, insert_before
+                auto field_alloca = new AllocaInst(
+                  struct_alloca_types->getContainedType(i), 0, struct_alloca->getName() + "[" + std::to_string(i) + "]", struct_alloca);
+                sub_alloca_fields.push_back(field_alloca);
+              }
+            }
+
+            // S2: update the users of the struct alloca;
+            for (const auto& user : struct_alloca->users()) {
+              if (auto geptr = dyn_cast<GetElementPtrInst>(user)) {
+                // struct alloca will be used by getelementptr;
+                // e.g., struct { int a; int b; } s;
+                //       s.a ~ getelementptr s, 0, 0;
+                //       s.b ~ getelementptr s, 0, 1;
+                // index is operand[2].
+                // We don't consider array for now.
+                size_t element_idx = dyn_cast<ConstantInt>(geptr->getOperand(2))->getZExtValue();
+                auto target_alloca = sub_alloca_fields.at(element_idx);
+
+                // cases like s.a or s.b is easy; we can just leave it alone;
+                if (geptr->getNumOperands() <= 3) {
+                  geptr->replaceAllUsesWith(target_alloca);
+                } else { // more complicated form; let's expand one layer once;
+                  // e.g., struct S1 {int a; int b;};  struct S2 {int x; struct S1 s1;};
+                  //       s2.s1.b ~ getelementptr s2, 0, 1, 1;
+                  // update -> getelementptr s2[1], 0, 1;
+                  //           getelementptr ${new_alloca}, 0, {op_begin() + 3, ...}
+                  std::vector<Value*> new_geptr_operands {ConstantInt::get(Type::getInt32Ty(F.getContext()), 0)};
+                  new_geptr_operands.insert(new_geptr_operands.end(), geptr->op_begin() + 3, geptr->op_end());
+                  // ? pointee typs is result type? (Not sure)
+                  auto new_geptr = GetElementPtrInst::Create(
+                    geptr->getResultElementType(), target_alloca, new_geptr_operands, geptr->getName() + "[" + std::to_string(element_idx) + "]", geptr);
+                  geptr->replaceAllUsesWith(new_geptr); 
+                }
+                // erase itself;
+                geptr->eraseFromParent();
+              }
+            }
+
+            // S3: erase the struct alloca
+            struct_alloca->eraseFromParent();
+            ++NumReplaced;
+            repl_changed = true;
+          }
         }
       }
 
-      return false;
+      return repl_changed;
     }())
       break;
     
