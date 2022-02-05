@@ -19,9 +19,11 @@
 //
 //===----------------------------------------------------------------------===//
 
+
 #define DEBUG_TYPE "scalarrepl"
 
 #include <iostream>
+#include <vector>
 
 #include "llvm/Support/Casting.h"
 #include "llvm/Transforms/Scalar.h"
@@ -30,6 +32,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/Pass.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/ADT/Statistic.h"
@@ -50,6 +53,7 @@ namespace {
     // getAnalysisUsage - List passes required by this pass.  We also know it
     // will not alter the CFG, so say so.
     virtual void getAnalysisUsage(AnalysisUsage &AU) const {
+      AU.addRequired<DominatorTreeWrapperPass>();
       AU.setPreservesCFG();
     }
 
@@ -101,6 +105,7 @@ bool isAllocaPromotable(const llvm::AllocaInst* inst) {
     }
   }
 
+  ++NumPromoted;
   return true;
 }
 
@@ -111,6 +116,9 @@ bool isAllocaPromotable(const llvm::AllocaInst* inst) {
 // Entry point for the overall ScalarReplAggregates function pass.
 // This function is provided to you.
 
+// Materials referenced: https://gcc.gnu.org/wiki/summit2010?action=AttachFile&do=get&target=jambor.pdf
+// Course material: https://charithm.web.illinois.edu/cs526/sp2022/cp1.pdf
+
 // TODO(JIAWEI): 
 // TASK: Implement `SROA`:
 //           S1: only consider alloca instructions;
@@ -118,9 +126,60 @@ bool isAllocaPromotable(const llvm::AllocaInst* inst) {
 //                   U1: `getelementptr` that "getelementpre ptr, 0, constant[, ... constant]"
 //                                       that result is only used in instructions of type U1 or U2 or as the pointer argument of load/store;
 bool SROA::runOnFunction(Function &F) {
+  bool cfg_changed = false;
 
-  bool Changed = false;
-  return Changed;
+  // Step 1: promote scalar allocas to virtual registers (mem2reg)
+  const auto scalar_promotion = [&F, this]{
+    bool cfg_changed = false;
+    auto&& bb = F.getEntryBlock();
 
+    while (true) {
+      std::vector<AllocaInst*> alloca_worklist{};
+      
+      for (auto&& inst : bb) {
+        if (auto alloca_inst = dyn_cast<AllocaInst>(&inst)) {
+          if (isAllocaPromotable(alloca_inst)) {
+            alloca_worklist.push_back(alloca_inst);
+          }
+        }
+      }
+
+      if (alloca_worklist.empty())
+        break;
+
+      cfg_changed = true;
+      NumPromoted += alloca_worklist.size();
+
+      // allocas, dominator tree, alias set tracker
+      // TODO(JIAWEI): `alias set tracker` not handled for now. But the type is "AssumptionCache"???
+      PromoteMemToReg(alloca_worklist, getAnalysis<DominatorTreeWrapperPass>().getDomTree());
+    }
+
+    return cfg_changed;
+  };
+
+  // Step 2: replace aggregate allocas with scalar allocas (sroa)
+  bool sora_changed = scalar_promotion();
+
+  while(true) {
+    bool sora_changed = [this]{
+      // TODO(JIAWEI): IMPL SROA.
+      return false;
+    }();
+
+    cfg_changed |= sora_changed;
+
+    // quit until no more changes.
+    if (!sora_changed)
+      break;
+    
+    cfg_changed = true;
+    
+    if (!scalar_promotion()) {
+      break;
+    }
+  }
+
+  return cfg_changed;
 }
 
