@@ -3,6 +3,7 @@
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Instruction.h>
+#include <llvm/Support/Debug.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/PassPlugin.h>
@@ -24,7 +25,6 @@ struct SwapAdd : llvm::PassInfoMixin<SwapAdd> {
 
             llvm::ReplaceInstWithInst(BB.getInstList(), inst, llvm::BinaryOperator::CreateAdd(binop->getOperand(1), binop->getOperand(0)));
 
-            LLVM_DEBUG( dbgs() << *binop << " -> " << *inst << '\n' );
             is_changed = true;
         }
         return is_changed;

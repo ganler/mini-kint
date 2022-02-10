@@ -3,8 +3,6 @@ PROJECT(llvm-pass-tutorial)
 
 
 SET(CMAKE_CXX_STANDARD 11)
-SET(CMAKE_C_COMPILER "clang")
-SET(CMAKE_CXX_COMPILER "clang++")
 
 # wget https://github.com/llvm/llvm-project/releases/download/llvmorg-8.0.1/clang+llvm-8.0.1-powerpc64le-linux-ubuntu-16.04.tar.xz
 FIND_PACKAGE(LLVM REQUIRED CONFIG HINTS "/home/ganler/Documents/CS526/clang+llvm-8.0.1-powerpc64le-linux-ubuntu-16.04/lib/cmake")
