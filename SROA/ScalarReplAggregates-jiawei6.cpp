@@ -19,16 +19,15 @@
 //
 //===----------------------------------------------------------------------===//
 
-
-#include "llvm/IR/Constant.h"
-#include "llvm/IR/Constants.h"
-#include "llvm/IR/Value.h"
 #include <cstddef>
 #define DEBUG_TYPE "scalarrepl"
 
 #include <iostream>
 #include <vector>
 
+#include "llvm/IR/Constant.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Value.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/IR/DerivedTypes.h"
