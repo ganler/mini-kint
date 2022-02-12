@@ -19,6 +19,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/IR/Instruction.h"
 #include <cstddef>
 #define DEBUG_TYPE "scalarrepl"
 
@@ -282,9 +283,9 @@ bool SROA::runOnFunction(Function &F) {
 bool SROA::isGetElementPtrSafeByUser(Function& F, const GetElementPtrInst* geptr_inst) const noexcept {
   // U1.1: getelementptr ptr,    0, constant[, ... constant]
   //                     ptr, this, const access;
-  bool is_safe_u11 = geptr_inst->getNumOperands() >= 3                                 /* >2 operands */ && \
-    geptr_inst->getOperand(1) == ConstantInt::get(Type::getInt32Ty(F.getContext()), 0) /* "0"         */ && \
-    [geptr_inst]{                                                                      /* "constant"  */
+  bool is_safe_u11 = geptr_inst->getNumOperands() >= 3                                          /* >2 operands */ && \
+    isa<ConstantInt>(geptr_inst) && cast<ConstantInt>(geptr_inst->getOperand(1))->isZero()      /* "0"         */ && \
+    [geptr_inst]{                                                                               /* "constant"  */
       for (size_t i = 2; i < geptr_inst->getNumOperands(); ++i)
         if (!isa<ConstantInt>(geptr_inst->getOperand(i)))
           return false;
@@ -295,19 +296,30 @@ bool SROA::isGetElementPtrSafeByUser(Function& F, const GetElementPtrInst* geptr
     return false;
 
   // U1.2: result value only used by U1 or U2; 
-  for (auto&& geptr_user : geptr_inst->uses()) {
+  for (const auto& geptr_user : geptr_inst->uses()) {
     // U1.2.1: argument in load/store;
-    if (const auto load_inst = dyn_cast<LoadInst>(geptr_user)) {
-      if (load_inst->getPointerOperand() != geptr_inst)
-        return false;
-    } else if (const auto store_inst = dyn_cast<StoreInst>(geptr_user)) {
-      if (store_inst->getPointerOperand() != geptr_inst)
-        return false;
-    } else if (const auto user_geptr_inst = dyn_cast<GetElementPtrInst>(geptr_user)) {
-      // U1.2.2: argument in getelementptr;
-      if (!isGetElementPtrSafeByUser(F, user_geptr_inst))
-        return false;
+    switch (cast<Instruction>(geptr_user)->getOpcode()) {
+      case Instruction::Load: continue; break;
+      case Instruction::Store: continue; break;
+      case Instruction::GetElementPtr:
+        const auto user_geptr_inst = cast<GetElementPtrInst>(geptr_user);
+        if (!isGetElementPtrSafeByUser(F, user_geptr_inst))
+          return false;
+        break;
     }
+
+    // Following code will cause segfault. No idea why.
+    // if (const auto load_inst = dyn_cast<LoadInst>(geptr_user)) {
+    //   if (load_inst->getPointerOperand() != geptr_inst)
+    //     return false;
+    // } else if (const auto store_inst = dyn_cast<StoreInst>(geptr_user)) {
+    //   if (store_inst->getPointerOperand() != geptr_inst)
+    //     return false;
+    // } else if (const auto user_geptr_inst = dyn_cast<GetElementPtrInst>(geptr_user)) {
+    //   // U1.2.2: argument in getelementptr;
+    //   if (!isGetElementPtrSafeByUser(F, user_geptr_inst))
+    //     return false;
+    // }
   }
 
   return true;
