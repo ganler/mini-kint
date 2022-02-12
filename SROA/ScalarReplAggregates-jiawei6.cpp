@@ -190,7 +190,7 @@ bool SROA::runOnFunction(Function &F) {
           if (auto struct_alloca = dyn_cast<AllocaInst>(alloca)) {
             if (![this, &F, struct_alloca]{
 
-              for (auto&& user : struct_alloca->users()) {
+              for (const auto& user : struct_alloca->users()) {
                 // U1: getelementptr;
                 if (const auto geptr_inst = dyn_cast<GetElementPtrInst>(user)) {
                     if (!isGetElementPtrSafeByUser(F, geptr_inst))
@@ -224,7 +224,7 @@ bool SROA::runOnFunction(Function &F) {
             }
 
             // S2: update the users of the struct alloca;
-            for (const auto& user : struct_alloca->users()) {
+            for (const auto& user : struct_alloca->uses()) {
               if (auto geptr = dyn_cast<GetElementPtrInst>(user)) {
                 // struct alloca will be used by getelementptr;
                 // e.g., struct { int a; int b; } s;
@@ -295,7 +295,7 @@ bool SROA::isGetElementPtrSafeByUser(Function& F, const GetElementPtrInst* geptr
     return false;
 
   // U1.2: result value only used by U1 or U2; 
-  for (auto&& geptr_user : geptr_inst->users()) {
+  for (auto&& geptr_user : geptr_inst->uses()) {
     // U1.2.1: argument in load/store;
     if (const auto load_inst = dyn_cast<LoadInst>(geptr_user)) {
       if (load_inst->getPointerOperand() != geptr_inst)
