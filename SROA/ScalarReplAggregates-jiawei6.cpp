@@ -307,7 +307,7 @@ bool SROA::isGetElementPtrSafeByUser(Function& F, const GetElementPtrInst* geptr
     } else if (const auto user_geptr_inst = dyn_cast<GetElementPtrInst>(geptr_user)) {
       // U1.2.2: argument in getelementptr;
       if (!isGetElementPtrSafeByUser(F, user_geptr_inst))
-        false;
+        return false;
     }
   }
 
