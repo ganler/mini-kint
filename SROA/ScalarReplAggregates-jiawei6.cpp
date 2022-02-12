@@ -19,7 +19,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/IR/Instruction.h"
 #include <cstddef>
 #define DEBUG_TYPE "scalarrepl"
 
@@ -177,10 +176,11 @@ bool SROA::runOnFunction(Function &F) {
         if (auto alloca_inst = dyn_cast<AllocaInst>(&inst)) {
           alloca_worklist.push_back(alloca_inst);
         }
+      }
 
-        while (!alloca_worklist.empty()) {
+      while (!alloca_worklist.empty()) {
           // start from the last element for best performance.
-          auto&& alloca = alloca_worklist.back();
+          auto struct_alloca = alloca_worklist.back();
           alloca_worklist.pop_back();
 
           // now we have eliminated scala allocas (isAllocaPromotable).
@@ -188,26 +188,38 @@ bool SROA::runOnFunction(Function &F) {
 
           // we first only consider struct
           // TODO(BONUS): handle array;
-          if (auto struct_alloca = dyn_cast<AllocaInst>(alloca)) {
+          if (isa<StructType>(struct_alloca->getAllocatedType())) {
             if (![this, &F, struct_alloca]{
 
               for (const auto& user : struct_alloca->users()) {
+                LLVM_DEBUG( dbgs() << struct_alloca->getName() << " used by " << *user << '\n' );
                 // U1: getelementptr;
                 if (const auto geptr_inst = dyn_cast<GetElementPtrInst>(user)) {
-                    if (!isGetElementPtrSafeByUser(F, geptr_inst))
+                    if (!isGetElementPtrSafeByUser(F, geptr_inst)) {
+                      LLVM_DEBUG( dbgs() << "UNSAFE GEP ~ " << *geptr_inst << '\n' );
                       return false;
+                    }
                 // U2: `eq` / `ne` against nullptr;
                 } else if (const auto cmp_inst = dyn_cast<ICmpInst>(user)) {
                   if (cmp_inst->getPredicate() == ICmpInst::ICMP_EQ || cmp_inst->getPredicate() == ICmpInst::ICMP_NE) {
                     if (!dyn_cast<ConstantPointerNull>(cmp_inst->getOperand(0)) && !dyn_cast<ConstantPointerNull>(cmp_inst->getOperand(1)))
+                      LLVM_DEBUG( dbgs() << "UNSAFE CMP ~ " << *geptr_inst << '\n' );
                       return false;
                   }
                 }
               }
 
+              LLVM_DEBUG( dbgs() << "PROMITABLE: \t" << *struct_alloca << '\n' );
               return true;
             }()) { // * Is it safe to promote it? Skip it if unsafe.
+              LLVM_DEBUG( dbgs() << "NOT PROMITABLE: \t" << struct_alloca->getName() << '\n' );
               continue;
+            }
+
+            std::vector<User*> substitution_cadidates = {};
+            substitution_cadidates.reserve(struct_alloca->getNumUses());
+            for (const auto& user : struct_alloca->users()) {
+              substitution_cadidates.push_back(user);
             }
 
             // struct alloca safe to be replaced now now;
@@ -219,13 +231,16 @@ bool SROA::runOnFunction(Function &F) {
               for (size_t i = 0; i < struct_alloca_types->getNumContainedTypes(); ++i) {
                 //                                 type, addr_space, name, insert_before
                 auto field_alloca = new AllocaInst(
-                  struct_alloca_types->getContainedType(i), 0, struct_alloca->getName() + "[" + std::to_string(i) + "]", struct_alloca);
+                  struct_alloca_types->getContainedType(i), 0, struct_alloca->getName() + std::to_string(i), struct_alloca);
+                LLVM_DEBUG( dbgs() << "Inserting " << *field_alloca << '\n' );
                 sub_alloca_fields.push_back(field_alloca);
               }
             }
 
             // S2: update the users of the struct alloca;
-            for (const auto& user : struct_alloca->uses()) {
+            LLVM_DEBUG( dbgs() << "Trying to substitute " << substitution_cadidates.size() << " uses in " << *struct_alloca << '\n' );
+            for (const auto& user : substitution_cadidates) {
+              
               if (auto geptr = dyn_cast<GetElementPtrInst>(user)) {
                 // struct alloca will be used by getelementptr;
                 // e.g., struct { int a; int b; } s;
@@ -235,6 +250,8 @@ bool SROA::runOnFunction(Function &F) {
                 // We don't consider array for now.
                 size_t element_idx = dyn_cast<ConstantInt>(geptr->getOperand(2))->getZExtValue();
                 auto target_alloca = sub_alloca_fields.at(element_idx);
+
+                LLVM_DEBUG( dbgs() << "Replacing" << *geptr << "for" << *target_alloca << '\n' );
 
                 // cases like s.a or s.b is easy; we can just leave it alone;
                 if (geptr->getNumOperands() <= 3) {
@@ -248,21 +265,30 @@ bool SROA::runOnFunction(Function &F) {
                   new_geptr_operands.insert(new_geptr_operands.end(), geptr->op_begin() + 3, geptr->op_end());
                   // ? pointee typs is result type? (Not sure)
                   auto new_geptr = GetElementPtrInst::Create(
-                    geptr->getResultElementType(), target_alloca, new_geptr_operands, geptr->getName() + "[" + std::to_string(element_idx) + "]", geptr);
+                    geptr->getResultElementType(), target_alloca, new_geptr_operands, geptr->getName() + std::to_string(element_idx), geptr);
                   geptr->replaceAllUsesWith(new_geptr); 
                 }
                 // erase itself;
                 geptr->eraseFromParent();
+              } else {
+                auto other_inst = cast<Instruction>(user);
+                for (size_t i = 0; i < other_inst->getNumOperands(); ++i) {
+                  if (other_inst->getOperand(i) == struct_alloca) {
+                    LLVM_DEBUG( dbgs() << "Replacing" << *other_inst->getOperand(i) << " -> " << *sub_alloca_fields[0] << "in" << *other_inst << '\n' );
+                    other_inst->setOperand(i, sub_alloca_fields[0]);
+                  }
+                }
               }
-            }
+            } 
 
-            // S3: erase the struct alloca
+            // S3: erase the struct alloca.
+            // Delete dead alloca from worklist.
+            alloca_worklist.erase(std::remove(alloca_worklist.begin(), alloca_worklist.end(), struct_alloca), alloca_worklist.end());
             struct_alloca->eraseFromParent();
             ++NumReplaced;
             repl_changed = true;
           }
         }
-      }
 
       return repl_changed;
     }())
@@ -284,7 +310,7 @@ bool SROA::isGetElementPtrSafeByUser(Function& F, const GetElementPtrInst* geptr
   // U1.1: getelementptr ptr,    0, constant[, ... constant]
   //                     ptr, this, const access;
   bool is_safe_u11 = geptr_inst->getNumOperands() >= 3                                          /* >2 operands */ && \
-    isa<ConstantInt>(geptr_inst) && cast<ConstantInt>(geptr_inst->getOperand(1))->isZero()      /* "0"         */ && \
+    isa<ConstantInt>(geptr_inst->getOperand(1)) && cast<ConstantInt>(geptr_inst->getOperand(1))->isZero()  /* "0"         */ && \
     [geptr_inst]{                                                                               /* "constant"  */
       for (size_t i = 2; i < geptr_inst->getNumOperands(); ++i)
         if (!isa<ConstantInt>(geptr_inst->getOperand(i)))
@@ -296,7 +322,7 @@ bool SROA::isGetElementPtrSafeByUser(Function& F, const GetElementPtrInst* geptr
     return false;
 
   // U1.2: result value only used by U1 or U2; 
-  for (const auto& geptr_user : geptr_inst->uses()) {
+  for (const auto& geptr_user : geptr_inst->users()) {
     // U1.2.1: argument in load/store;
     switch (cast<Instruction>(geptr_user)->getOpcode()) {
       case Instruction::Load: continue; break;
