@@ -1,0 +1,13 @@
+import sys
+
+config.llvm_tools_dir = "@LLVM_ROOT@/bin"
+config.llvm_shlib_ext = "@SHARED_LIB_SUFFXI@"
+config.llvm_build_dir = "@CMAKE_BINARY_DIR@"
+
+import lit.llvm
+
+lit.llvm.initialize(lit_config, config)
+
+config.test_exec_root = os.path.join("@CMAKE_CURRENT_BINARY_DIR@")
+
+lit_config.load_config(config, "@LT_TEST_SRC_DIR@/lit.cfg.py")
