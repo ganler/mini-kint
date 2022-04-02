@@ -1,7 +1,5 @@
 #pragma once
 
-#include <llvm/ADT/StringRef.h>
-
 #include <cstddef>
 #include <ostream>
 #include <string_view>
