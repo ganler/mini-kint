@@ -1,4 +1,5 @@
 #include "log.hpp"
+#include "smt.hpp"
 
 #include <llvm/IR/PassManager.h>
 #include <llvm/Passes/PassBuilder.h>
@@ -14,8 +15,9 @@ namespace {
 struct MKintPass : public PassInfoMixin<MKintPass> {
     PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM)
     {
+        test_smt();
         MKINT_LOG() << "Running MKint pass on function " << F.getName();
-        MKINT_CHECK_ABORT(1 + 1 == 0) << "  Function has " << F.size() << " basic blocks";
+        MKINT_CHECK(1 + 1 == 0) << "  Function has " << F.size() << " basic blocks";
         return PreservedAnalyses::all();
     }
 };

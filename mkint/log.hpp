@@ -57,15 +57,14 @@ detail::log_wrapper check(bool cond, bool abort, std::string_view prompt, std::s
 } // namespace mkint
 
 #define MKINT_LOG() mkint::log()
+
+#define MKINT_CHECK_1(cond) \
+    mkint::check(cond, true, #cond, __FILE__, __LINE__)
 #define MKINT_CHECK_2(cond, abort) \
     mkint::check(cond, abort, #cond, __FILE__, __LINE__)
 
-#define MKINT_CHECK_1(cond) MKINT_CHECK_2(cond, true);
-
-#define GET_3RD_ARG(arg1, arg2, arg3, ...) arg3
-#define MKINT_CHECK_MACRO_CHOOSER(...) \
-    GET_3RD_ARG(__VA_ARGS__, MKINT_CHECK_2, MKINT_CHECK_1, )
-#define MKINT_CHECK(...) MKINT_CHECK_MACRO_CHOOSER(__VA_ARGS__)(__VA_ARGS__)
+#define MKINT_CHECK_X(x, cond, abort, FUNC, ...) FUNC
+#define MKINT_CHECK(...) MKINT_CHECK_X(, ##__VA_ARGS__, MKINT_CHECK_2(__VA_ARGS__), MKINT_CHECK_1(__VA_ARGS__))
 
 #define MKINT_CHECK_RELAX(cond) MKINT_CHECK_2(cond, false)
 #define MKINT_CHECK_ABORT(cond) MKINT_CHECK_2(cond, true)

@@ -13,7 +13,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=1
 ## Worklist
 
 - [x] (Basic::Logger) add logger library for debugging and checking;
-- [ ] (Basic::Z3) integrate Z3 environment in CMake;
+- [x] (Basic::Z3) integrate Z3 environment in CMake;
 
 ## Bound checking
 
