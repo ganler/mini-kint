@@ -18,6 +18,8 @@ EXTERNALPROJECT_ADD(
   TEST_COMMAND ""
 )
 
+INCLUDE_DIRECTORIES(${CMAKE_CURRENT_BINARY_DIR}/z3/include)
+
 # https://github.com/llvm-mirror/llvm/blob/master/cmake/modules/AddLLVM.cmake
 add_llvm_library(MiniKintPass 
     MODULE mkint.cpp log.cpp
