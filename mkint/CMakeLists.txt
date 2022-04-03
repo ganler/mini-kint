@@ -24,6 +24,6 @@ INCLUDE_DIRECTORIES(${CMAKE_CURRENT_BINARY_DIR}/z3/include)
 add_llvm_library(MiniKintPass 
     MODULE mkint.cpp log.cpp
     DEPENDS z3-repo
-    LINK_LIBS z3
+    LINK_LIBS "${CMAKE_CURRENT_BINARY_DIR}/z3/lib/${CMAKE_SHARED_LIBRARY_PREFIX}z3${CMAKE_SHARED_LIBRARY_SUFFIX}"
     PLUGIN_TOOL opt
     )
