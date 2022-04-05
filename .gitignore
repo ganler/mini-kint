@@ -3,3 +3,4 @@ build
 Output
 .lit_test_times.txt
 __pycache__
+.DS_Store
