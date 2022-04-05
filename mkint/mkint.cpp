@@ -24,7 +24,7 @@ constexpr const char* MKINT_IR_ERR = "mkint.err";
 namespace {
 
 enum class interr {
-    OVERFLOW,
+    OUT_OF_BOUND,
     DIV_BY_ZERO,
     BAD_SHIFT,
     NEG_IDX,
@@ -34,8 +34,8 @@ enum class interr {
 
 template <interr err, typename StrRet = const char*>
 constexpr StrRet mkstr() {
-    if constexpr (err == interr::OVERFLOW) {
-        return "overflow";
+    if constexpr (err == interr::OUT_OF_BOUND) {
+        return "out of boundary";
     } else if (err == interr::DIV_BY_ZERO) {
         return "divide by zero";
     } else if (err == interr::BAD_SHIFT) {
@@ -46,7 +46,7 @@ constexpr StrRet mkstr() {
         return "annotation violation";
     } else {
         static_assert(
-            err == interr::OVERFLOW ||
+            err == interr::OUT_OF_BOUND ||
             err == interr::DIV_BY_ZERO ||
             err == interr::BAD_SHIFT ||
             err == interr::NEG_IDX ||
@@ -91,7 +91,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         // FIXME: This is some dummy code to test.
         auto&& bb = F.getEntryBlock();
         for (auto& inst : bb) {
-            mark_err<interr::OVERFLOW>(inst);
+            mark_err<interr::OUT_OF_BOUND>(inst);
         }
 
         return PreservedAnalyses::all();
