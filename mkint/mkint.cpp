@@ -1,9 +1,9 @@
 #include "log.hpp"
 #include "smt.hpp"
 
-#include <llvm-14/llvm/IR/DerivedTypes.h>
-#include <llvm-14/llvm/IR/Instructions.h>
-#include <llvm-14/llvm/Support/Casting.h>
+#include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/Support/Casting.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Metadata.h>
 #include <llvm/IR/PassManager.h>
@@ -122,7 +122,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
         auto& ctx = F.getContext();
 
-        // TODO: MiniPass 1: Broadcast taint/sink;
+        // MiniPass 1: Mark (source) taint/sink;
         mark_taint_source(F);
         for (auto& inst : instructions(F)) {
             if (auto* call = dyn_cast<CallInst>(&inst)) {
@@ -136,8 +136,10 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 }
             }
         }
+        // MiniPass 2: Broadcast taint;
+
         // TODO:           : Mark instructions to check and checking type;
-        // TODO: MiniPass 2: Collect constraints and solve;
+        // TODO: MiniPass 3: Collect constraints and solve;
         // TODO:           : Remove label if violation not sat;
 
         // FIXME: This is some dummy code to test.
