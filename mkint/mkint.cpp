@@ -1,14 +1,16 @@
 #include "log.hpp"
 #include "smt.hpp"
 
+#include <llvm-14/llvm/ADT/SetVector.h>
+#include <llvm-14/llvm/ADT/SmallVector.h>
 #include <llvm/IR/DerivedTypes.h>
-#include <llvm/IR/Instructions.h>
-#include <llvm/Support/Casting.h>
 #include <llvm/IR/Instruction.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/Metadata.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/PassPlugin.h>
+#include <llvm/Support/Casting.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <array>
@@ -16,6 +18,7 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 using namespace llvm;
 
@@ -90,8 +93,9 @@ static void mark_sink(Instruction& inst, std::string_view sink_name = "")
     inst.setMetadata(MKINT_IR_SINK, md);
 }
 
-static void mark_taint_source(Function& F)
+std::vector<Instruction*> mark_taint_source(Function& F)
 {
+    std::vector<Instruction*> ret;
     // judge if this function is the taint source.
     const auto name = F.getName();
     if (name.startswith("sys_") || name.startswith("__mkint_ann_")) {
@@ -110,7 +114,33 @@ static void mark_taint_source(Function& F)
                 arg.getName(),
                 &*F.getEntryBlock().getFirstInsertionPt());
             mark_taint(*call_inst);
+            ret.push_back(call_inst);
             arg.replaceAllUsesWith(call_inst);
+        }
+    }
+    return ret;
+}
+
+static void taint_broadcasting(
+    const std::vector<Instruction*>& taint_source)
+{
+    // TODO: Consider global variable;
+    // TODO: Consider function arguments;
+    SetVector<Instruction*> marked_taints {};
+    auto taint_worklist = taint_source;
+    while (!taint_worklist.empty()) {
+        auto inst = taint_worklist.back();
+        taint_worklist.pop_back();
+
+        for (auto user : inst->users()) {
+            if (auto user_inst = dyn_cast<Instruction>(user)) {
+                if (user_inst->getMetadata(MKINT_IR_TAINT) || user_inst->getMetadata(MKINT_IR_SINK)) {
+                    continue;
+                }
+                mark_taint(*user_inst);
+                marked_taints.insert(user_inst);
+                taint_worklist.push_back(user_inst);
+            }
         }
     }
 }
@@ -123,21 +153,22 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         auto& ctx = F.getContext();
 
         // MiniPass 1: Mark (source) taint/sink;
-        mark_taint_source(F);
+        auto taint_sources = mark_taint_source(F);
         for (auto& inst : instructions(F)) {
             if (auto* call = dyn_cast<CallInst>(&inst)) {
                 // call in MKINT_SINKS
                 for (const auto& [name, idx] : MKINT_SINKS) {
                     if (call->getCalledFunction()->getName().startswith(name)) {
-                        if (auto inst = dyn_cast_or_null<Instruction>(call->getArgOperand(idx)))
+                        if (auto inst = dyn_cast_or_null<Instruction>(call->getArgOperand(idx))) {
                             mark_sink(*inst, name);
+                        }
                         break;
                     }
                 }
             }
         }
         // MiniPass 2: Broadcast taint;
-
+        taint_broadcasting(taint_sources);
         // TODO:           : Mark instructions to check and checking type;
         // TODO: MiniPass 3: Collect constraints and solve;
         // TODO:           : Remove label if violation not sat;
