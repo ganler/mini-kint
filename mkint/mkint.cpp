@@ -29,16 +29,13 @@ constexpr const char* MKINT_IR_TAINT = "mkint.taint";
 constexpr const char* MKINT_IR_SINK = "mkint.sink";
 constexpr const char* MKINT_IR_ERR = "mkint.err";
 
-template <typename V, typename... Vs>
-static constexpr std::array<V, sizeof...(Vs)> mkarray(Vs&&... vs) noexcept
+template <typename V, typename... Vs> static constexpr std::array<V, sizeof...(Vs)> mkarray(Vs&&... vs) noexcept
 {
     return std::array<V, sizeof...(Vs)> { vs... };
 }
 
 constexpr auto MKINT_SINKS = mkarray<std::pair<std::string_view, size_t>>(
-    std::pair { "kmalloc", 0 },
-    std::pair { "kzalloc", 0 },
-    std::pair { "vmalloc", 0 });
+    std::pair { "kmalloc", 0 }, std::pair { "kzalloc", 0 }, std::pair { "vmalloc", 0 });
 
 namespace {
 
@@ -50,8 +47,7 @@ enum class interr {
     VIOLATE_ANN,
 };
 
-template <interr err, typename StrRet = const char*>
-constexpr StrRet mkstr()
+template <interr err, typename StrRet = const char*> constexpr StrRet mkstr()
 {
     if constexpr (err == interr::OUT_OF_BOUND) {
         return "out of boundary";
@@ -64,15 +60,14 @@ constexpr StrRet mkstr()
     } else if (err == interr::VIOLATE_ANN) {
         return "annotation violation";
     } else {
-        static_assert(
-            err == interr::OUT_OF_BOUND || err == interr::DIV_BY_ZERO || err == interr::BAD_SHIFT || err == interr::NEG_IDX || err == interr::VIOLATE_ANN,
+        static_assert(err == interr::OUT_OF_BOUND || err == interr::DIV_BY_ZERO || err == interr::BAD_SHIFT
+                || err == interr::NEG_IDX || err == interr::VIOLATE_ANN,
             "unknown error type");
         return ""; // statically impossible
     }
 }
 
-template <interr err_t>
-static void mark_err(Instruction& inst)
+template <interr err_t> static void mark_err(Instruction& inst)
 {
     auto& ctx = inst.getContext();
     auto md = MDNode::get(ctx, MDString::get(ctx, mkstr<err_t>()));
@@ -109,9 +104,7 @@ std::vector<Instruction*> mark_taint_source(Function& F)
             }
             auto call_name = name.str() + ".mkint.arg" + std::to_string(arg.getArgNo());
             MKINT_LOG() << "Replacing taint arg -> call inst: " << call_name;
-            auto call_inst = CallInst::Create(
-                F.getParent()->getOrInsertFunction(call_name, itype),
-                arg.getName(),
+            auto call_inst = CallInst::Create(F.getParent()->getOrInsertFunction(call_name, itype), arg.getName(),
                 &*F.getEntryBlock().getFirstInsertionPt());
             mark_taint(*call_inst);
             ret.push_back(call_inst);
@@ -121,13 +114,15 @@ std::vector<Instruction*> mark_taint_source(Function& F)
     return ret;
 }
 
-static void taint_broadcasting(
-    const std::vector<Instruction*>& taint_source)
+static bool taint_broadcasting(const std::vector<Instruction*>& taint_source)
 {
     // TODO: Consider global variable;
     // TODO: Consider function arguments;
+    bool ret_taint = false;
+
     SetVector<Instruction*> marked_taints {};
     auto taint_worklist = taint_source;
+
     while (!taint_worklist.empty()) {
         auto inst = taint_worklist.back();
         taint_worklist.pop_back();
@@ -149,7 +144,9 @@ static void taint_broadcasting(
                                     // do broadcasting.
                                     for (auto callf_u : callf->getArg(i)->users()) {
                                         if (auto callf_u_inst = dyn_cast<Instruction>(callf_u)) {
-                                            if (!callf_u_inst->getMetadata(MKINT_IR_TAINT)) {
+                                            if (!callf_u_inst->getMetadata(MKINT_IR_TAINT)
+                                                && !callf_u_inst->getMetadata(MKINT_IR_SINK)) {
+                                                // not a taint and not a sink.
                                                 mark_taint(*callf_u_inst);
                                                 callf_taints.insert(callf_u_inst);
                                             }
@@ -158,8 +155,12 @@ static void taint_broadcasting(
                                 }
                             }
                         }
-                        taint_broadcasting(callf_taints.takeVector());
+                        if (!taint_broadcasting(callf_taints.takeVector()))
+                            continue; // don't mark the callf as taint if its result is tainted.
+                        // TODO: higher precision: don't mark the chain if it cannot reach the sink.
                     }
+                } else if (auto ret_inst = dyn_cast<ReturnInst>(user_inst)) {
+                    ret_taint = true;
                 }
 
                 mark_taint(*user_inst);
@@ -168,6 +169,8 @@ static void taint_broadcasting(
             }
         }
     }
+
+    return ret_taint;
 }
 
 struct MKintPass : public PassInfoMixin<MKintPass> {
@@ -210,13 +213,11 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 } // namespace
 
 // registering pass (new pass manager).
-extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK
-llvmGetPassPluginInfo()
+extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK llvmGetPassPluginInfo()
 {
     return { LLVM_PLUGIN_API_VERSION, "MKintPass", "v0.1", [](PassBuilder& PB) {
                 PB.registerPipelineParsingCallback(
-                    [](StringRef Name, FunctionPassManager& FPM,
-                        ArrayRef<PassBuilder::PipelineElement>) {
+                    [](StringRef Name, FunctionPassManager& FPM, ArrayRef<PassBuilder::PipelineElement>) {
                         if (Name == "mkint-pass") {
                             FPM.addPass(MKintPass());
                             return true;
