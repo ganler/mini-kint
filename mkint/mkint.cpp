@@ -1,8 +1,8 @@
 #include "log.hpp"
 #include "smt.hpp"
 
-#include <llvm-14/llvm/ADT/SetVector.h>
-#include <llvm-14/llvm/ADT/SmallVector.h>
+#include <llvm/ADT/SetVector.h>
+#include <llvm/ADT/SmallVector.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
@@ -137,6 +137,31 @@ static void taint_broadcasting(
                 if (user_inst->getMetadata(MKINT_IR_TAINT) || user_inst->getMetadata(MKINT_IR_SINK)) {
                     continue;
                 }
+
+                if (auto call_inst = dyn_cast<CallInst>(user_inst)) {
+                    // call(a0, a1, ...): broadcast taints to a[?] if a[?] is tainted.
+                    if (auto callf = call_inst->getCalledFunction()) {
+                        SetVector<Instruction*> callf_taints {};
+                        for (size_t i = 0; i < callf->arg_size(); ++i) {
+                            auto operand = call_inst->getArgOperand(i);
+                            if (auto call_inst_arg_inst = dyn_cast<Instruction>(operand)) {
+                                if (call_inst_arg_inst->getMetadata(MKINT_IR_TAINT)) {
+                                    // do broadcasting.
+                                    for (auto callf_u : callf->getArg(i)->users()) {
+                                        if (auto callf_u_inst = dyn_cast<Instruction>(callf_u)) {
+                                            if (!callf_u_inst->getMetadata(MKINT_IR_TAINT)) {
+                                                mark_taint(*callf_u_inst);
+                                                callf_taints.insert(callf_u_inst);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        taint_broadcasting(callf_taints.takeVector());
+                    }
+                }
+
                 mark_taint(*user_inst);
                 marked_taints.insert(user_inst);
                 taint_worklist.push_back(user_inst);
@@ -174,10 +199,10 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         // TODO:           : Remove label if violation not sat;
 
         // FIXME: This is some dummy code to test.
-        auto&& bb = F.getEntryBlock();
-        for (auto& inst : bb) {
-            mark_err<interr::OUT_OF_BOUND>(inst);
-        }
+        // auto&& bb = F.getEntryBlock();
+        // for (auto& inst : bb) {
+        //     mark_err<interr::OUT_OF_BOUND>(inst);
+        // }
 
         return PreservedAnalyses::all();
     }
