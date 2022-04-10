@@ -81,14 +81,7 @@ static void mark_taint(Instruction& inst, std::string_view taint_name = "")
     inst.setMetadata(MKINT_IR_TAINT, md);
 }
 
-static void mark_sink(Instruction& inst, std::string_view sink_name = "")
-{
-    auto& ctx = inst.getContext();
-    auto md = MDNode::get(ctx, MDString::get(ctx, sink_name));
-    inst.setMetadata(MKINT_IR_SINK, md);
-}
-
-std::vector<Instruction*> mark_taint_source(Function& F)
+static std::vector<Instruction*> get_taint_source(Function& F)
 {
     std::vector<Instruction*> ret;
     // judge if this function is the taint source.
@@ -106,7 +99,6 @@ std::vector<Instruction*> mark_taint_source(Function& F)
             MKINT_LOG() << "Replacing taint arg -> call inst: " << call_name;
             auto call_inst = CallInst::Create(F.getParent()->getOrInsertFunction(call_name, itype), arg.getName(),
                 &*F.getEntryBlock().getFirstInsertionPt());
-            mark_taint(*call_inst);
             ret.push_back(call_inst);
             arg.replaceAllUsesWith(call_inst);
         }
@@ -114,63 +106,70 @@ std::vector<Instruction*> mark_taint_source(Function& F)
     return ret;
 }
 
-static bool taint_broadcasting(const std::vector<Instruction*>& taint_source)
+static bool is_sink_reachable(Instruction* inst)
 {
-    // TODO: Consider global variable;
-    // TODO: Consider function arguments;
-    bool ret_taint = false;
+    // we want to only mark sink-reachable taints; and
+    // find out if the return value is tainted.
+    if (nullptr == inst) {
+        return false;
+    } else if (inst->getMetadata(MKINT_IR_SINK)) {
+        return true;
+    }
 
-    SetVector<Instruction*> marked_taints {};
-    auto taint_worklist = taint_source;
-
-    while (!taint_worklist.empty()) {
-        auto inst = taint_worklist.back();
-        taint_worklist.pop_back();
-
-        for (auto user : inst->users()) {
-            if (auto user_inst = dyn_cast<Instruction>(user)) {
-                if (user_inst->getMetadata(MKINT_IR_TAINT) || user_inst->getMetadata(MKINT_IR_SINK)) {
-                    continue;
-                }
-
-                if (auto call_inst = dyn_cast<CallInst>(user_inst)) {
-                    // call(a0, a1, ...): broadcast taints to a[?] if a[?] is tainted.
-                    if (auto callf = call_inst->getCalledFunction()) {
-                        SetVector<Instruction*> callf_taints {};
-                        for (size_t i = 0; i < callf->arg_size(); ++i) {
-                            auto operand = call_inst->getArgOperand(i);
-                            if (auto call_inst_arg_inst = dyn_cast<Instruction>(operand)) {
-                                if (call_inst_arg_inst->getMetadata(MKINT_IR_TAINT)) {
-                                    // do broadcasting.
-                                    for (auto callf_u : callf->getArg(i)->users()) {
-                                        if (auto callf_u_inst = dyn_cast<Instruction>(callf_u)) {
-                                            if (!callf_u_inst->getMetadata(MKINT_IR_TAINT)
-                                                && !callf_u_inst->getMetadata(MKINT_IR_SINK)) {
-                                                // not a taint and not a sink.
-                                                mark_taint(*callf_u_inst);
-                                                callf_taints.insert(callf_u_inst);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if (!taint_broadcasting(callf_taints.takeVector()))
-                            continue; // don't mark the callf as taint if its result is tainted.
-                        // TODO: higher precision: don't mark the chain if it cannot reach the sink.
-                    }
-                } else if (auto ret_inst = dyn_cast<ReturnInst>(user_inst)) {
-                    ret_taint = true;
-                }
-
-                mark_taint(*user_inst);
-                marked_taints.insert(user_inst);
-                taint_worklist.push_back(user_inst);
-            }
+    bool you_see_sink /* ? */ = false;
+    for (auto user : inst->users()) {
+        if (auto user_inst = dyn_cast<Instruction>(user)) {
+            you_see_sink |= is_sink_reachable(user_inst);
         }
     }
 
-    return ret_taint;
+    if (you_see_sink) {
+        mark_taint(*inst);
+        return true;
+    }
+
+    return false;
+}
+
+static void taint_broadcasting(const std::vector<Instruction*>& taint_source)
+{
+    // ? Note we currently assume that sub-func-calls do not have sinks...
+    // ? otherwise we need a use-def tree to do the job (but too complicated).
+    // Propogation: This pass should only consider single-function-level tainting.
+    //              In `out = call(..., taint, ...)`, `out` is tainted. But let's
+    //              refine that in cross-function-level tainting.
+
+    // Algo: should do depth-first search until we find a sink. If we find a sink,
+    //       we backtrack and mark taints.
+
+    for (auto ts : taint_source) {
+        if (is_sink_reachable(ts)) {
+            mark_taint(*ts);
+        }
+    }
+}
+
+static void mark_func_sinks(Function& F)
+{
+    static auto mark_sink = [](Instruction& inst, std::string_view sink_name) {
+        auto& ctx = inst.getContext();
+        auto md = MDNode::get(ctx, MDString::get(ctx, sink_name));
+        inst.setMetadata(MKINT_IR_SINK, md);
+    };
+
+    for (auto& inst : instructions(F)) {
+        if (auto* call = dyn_cast<CallInst>(&inst)) {
+            // call in MKINT_SINKS
+            for (const auto& [name, idx] : MKINT_SINKS) {
+                if (call->getCalledFunction()->getName().startswith(name)) {
+                    if (auto inst = dyn_cast_or_null<Instruction>(call->getArgOperand(idx))) {
+                        mark_sink(*inst, name);
+                    }
+                    break;
+                }
+            }
+        }
+    }
 }
 
 struct MKintPass : public PassInfoMixin<MKintPass> {
@@ -181,25 +180,20 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         auto& ctx = F.getContext();
 
         // MiniPass 1: Mark (source) taint/sink;
-        auto taint_sources = mark_taint_source(F);
-        for (auto& inst : instructions(F)) {
-            if (auto* call = dyn_cast<CallInst>(&inst)) {
-                // call in MKINT_SINKS
-                for (const auto& [name, idx] : MKINT_SINKS) {
-                    if (call->getCalledFunction()->getName().startswith(name)) {
-                        if (auto inst = dyn_cast_or_null<Instruction>(call->getArgOperand(idx))) {
-                            mark_sink(*inst, name);
-                        }
-                        break;
-                    }
-                }
-            }
-        }
+        // * Note we must do this first b.c. this is a write pass.
+        // * the remaining stuff will at most add some metadata.
+        auto taint_sources = get_taint_source(F);
+        // for now, the taint_source are not marked as taint.
+        // because we only mark taints if sinks are reachable for a certain taint candidate.
+        mark_func_sinks(F);
+
         // MiniPass 2: Broadcast taint;
         taint_broadcasting(taint_sources);
-        // TODO:           : Mark instructions to check and checking type;
-        // TODO: MiniPass 3: Collect constraints and solve;
-        // TODO:           : Remove label if violation not sat;
+        // TODO: MiniPass 3: Collect constraints;
+
+        // TODO: -> Move to module pass!
+        // TODO: MiniPass 4: Traverse the paths and solve constraints;
+        // TODO:           : Add mkint.err label if violation detected.
 
         // FIXME: This is some dummy code to test.
         // auto&& bb = F.getEntryBlock();
@@ -207,7 +201,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         //     mark_err<interr::OUT_OF_BOUND>(inst);
         // }
 
-        return PreservedAnalyses::all();
+        return PreservedAnalyses::all(); // TODO: I actually cannot tell which analysis are preserved.
     }
 };
 } // namespace
