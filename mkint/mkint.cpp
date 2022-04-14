@@ -144,7 +144,7 @@ static void taint_broadcasting(const std::vector<Instruction*>& taint_source)
 
     for (auto ts : taint_source) {
         if (is_sink_reachable(ts)) {
-            mark_taint(*ts);
+            mark_taint(*ts, "source");
         }
     }
 }
