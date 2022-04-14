@@ -1,6 +1,9 @@
 #include "log.hpp"
 #include "smt.hpp"
 
+#include <llvm-14/llvm/ADT/MapVector.h>
+#include <llvm-14/llvm/ADT/StringRef.h>
+#include <llvm-14/llvm/IR/Function.h>
 #include <llvm/ADT/SetVector.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/IR/DerivedTypes.h>
@@ -201,6 +204,8 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         //     mark_err<interr::OUT_OF_BOUND>(inst);
         // }
 
+        if (!taint_sources.empty())
+            m_func2tsrc[F.getName()] = std::move(taint_sources);
         return PreservedAnalyses::all(); // TODO: I actually cannot tell which analysis are preserved.
     }
 
@@ -210,10 +215,19 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
         for (auto& F : M) {
             run(F, MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager());
-        }
+        } // no writes anymore (except writing metadata).
 
         return PreservedAnalyses::all();
     }
+
+    void glob_symbols_constraints(const Function& F)
+    {
+        // build symbols for each (tainted) instruction;
+        // collect basic constraints.
+    }
+
+private:
+    MapVector<StringRef, std::vector<Instruction*>> m_func2tsrc;
 };
 } // namespace
 
