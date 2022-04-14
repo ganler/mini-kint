@@ -86,7 +86,7 @@ static std::vector<Instruction*> get_taint_source(Function& F)
     std::vector<Instruction*> ret;
     // judge if this function is the taint source.
     const auto name = F.getName();
-    if (name.startswith("sys_") || name.startswith("__mkint_ann_")) {
+    if (name.startswith("sys_") || (name.startswith("__mkint_ann_") && !name.contains(".mkint.arg"))) {
         // mark all this function as a taint source.
         // Unfortunately arguments cannot be marked with metadata...
         // We need to rewrite the arguments -> unary callers and mark the callers.
@@ -203,6 +203,17 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
         return PreservedAnalyses::all(); // TODO: I actually cannot tell which analysis are preserved.
     }
+
+    PreservedAnalyses run(Module& M, ModuleAnalysisManager& MAM)
+    {
+        MKINT_LOG() << "Running MKint pass on module " << M.getName();
+
+        for (auto& F : M) {
+            run(F, MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager());
+        }
+
+        return PreservedAnalyses::all();
+    }
 };
 } // namespace
 
@@ -211,9 +222,9 @@ extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK llvmGetPassPluginIn
 {
     return { LLVM_PLUGIN_API_VERSION, "MKintPass", "v0.1", [](PassBuilder& PB) {
                 PB.registerPipelineParsingCallback(
-                    [](StringRef Name, FunctionPassManager& FPM, ArrayRef<PassBuilder::PipelineElement>) {
+                    [](StringRef Name, ModulePassManager& MPM, ArrayRef<PassBuilder::PipelineElement>) {
                         if (Name == "mkint-pass") {
-                            FPM.addPass(MKintPass());
+                            MPM.addPass(MKintPass());
                             return true;
                         }
                         return false;
