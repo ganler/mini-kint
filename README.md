@@ -18,7 +18,9 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=1
   - [x] Taint source and sink mark;
   - [x] Taint broadcasting;
 - [ ] Per-function range analysis;
+  - [x] Backedge analysis; 
   - [x] Binary operator;
+  - [ ] Branch handling;
   - [ ] Unary operator;
   - [ ] Casting (if have time);
 - [ ] Constraint collection;
