@@ -73,18 +73,7 @@ struct crange : public ConstantRange {
 
 namespace {
 
-struct func_range_info {
-    SmallVector<crange, 4> arg_ranges;
-    crange ret_range;
-    std::map<BasicBlock*, std::map<Instruction*, crange>> bb_ranges;
-
-    void init(const Function& F)
-    {
-        for (auto& arg : F.args()) {
-            arg_ranges.push_back(crange(arg.getType()->getIntegerBitWidth()));
-        }
-    }
-};
+using bbrange_t = std::map<const BasicBlock*, std::map<const Value*, crange>>;
 
 enum class interr {
     OUT_OF_BOUND,
@@ -308,10 +297,10 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         std::vector<const BasicBlock*> worklist;
         worklist.push_back(&(F.getEntryBlock()));
 
-        std::map<const BasicBlock*, std::map<const Value*, crange>> bb_range;
+        auto& bb_range = m_func2range_info[&F];
 
         for (const auto& arg : F.args()) {
-            if (arg.getType()->isIntegerTy()) {
+            if (arg.getType()->isIntegerTy() && bb_range[&(F.getEntryBlock())].count(&arg) == 0) {
                 bb_range[&(F.getEntryBlock())][&arg] = crange(arg.getType()->getIntegerBitWidth());
             }
         }
@@ -338,36 +327,40 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 }
             }
 
+            // TODO: check pred branch for conditions.
+
             for (auto& inst : bb->getInstList()) {
+                const auto get_rng = [&bb_range, &bb, &inst](auto var) {
+                    if (auto lconst = dyn_cast<ConstantInt>(var)) {
+                        return crange(lconst->getValue());
+                    } else {
+                        if (bb_range[bb].count(var) == 0) {
+                            std::string str;
+                            llvm::raw_string_ostream(str) << *var << " in " << inst;
+                            MKINT_CHECK_ABORT(false) << "Unknown operand type: " << str;
+                        }
+                        return bb_range[bb][var];
+                    }
+                };
+                // TODO: handle void types:
+                // Store / Call / Return
+
+                // return type should be int
+                if (!inst.getType()->isIntegerTy()) {
+                    continue;
+                }
+
+                crange new_range;
+
                 if (const BinaryOperator* op = dyn_cast<BinaryOperator>(&inst)) {
                     auto lhs = op->getOperand(0);
                     auto rhs = op->getOperand(1);
 
-                    crange lhs_range {}, rhs_range {};
-                    if (auto lconst = dyn_cast<ConstantInt>(lhs)) {
-                        lhs_range = crange(lconst->getValue());
-                    } else {
-                        if (bb_range[bb].count(lhs) == 0) {
-                            std::string str;
-                            llvm::raw_string_ostream(str) << *lhs << " in " << inst;
-                            MKINT_CHECK_ABORT(false) << "Unknown operand type: " << str;
-                        }
-                        lhs_range = bb_range[bb][lhs];
-                    }
-
-                    if (auto rconst = dyn_cast<ConstantInt>(rhs)) {
-                        rhs_range = crange(rconst->getValue());
-                    } else {
-                        if (bb_range[bb].count(rhs) == 0) {
-                            std::string str;
-                            llvm::raw_string_ostream(str) << *rhs << " in " << inst;
-                            MKINT_CHECK_ABORT(false) << "Unknown operand type: " << str;
-                        }
-                        rhs_range = bb_range[bb][rhs];
-                    }
-
-                    bb_range[bb][&inst] = compute_range(op, lhs_range, rhs_range);
+                    crange lhs_range = get_rng(lhs), rhs_range = get_rng(rhs);
+                    new_range = compute_range(op, lhs_range, rhs_range);
                 }
+
+                bb_range[bb][&inst] = bb_range[bb][&inst].unionWith(new_range);
             }
         }
 
@@ -384,11 +377,6 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
         constexpr size_t max_try = 128;
         size_t try_count = 0;
-        // initialize range ananlysis
-        for (auto& F : M) {
-            auto& rinfo = m_func2range_info[&F];
-            rinfo.init(F);
-        }
 
         for (auto& F : M) {
             if (!F.isDeclaration()) {
@@ -419,7 +407,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
 private:
     MapVector<StringRef, std::vector<Instruction*>> m_func2tsrc;
-    std::map<Function*, func_range_info> m_func2range_info;
+    std::map<const Function*, bbrange_t> m_func2range_info;
     std::map<const BasicBlock*, SetVector<const BasicBlock*>> m_backedges;
 };
 } // namespace
