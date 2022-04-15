@@ -278,39 +278,92 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             m_func2tsrc[F.getName()] = std::move(taint_sources);
     }
 
+    void backedge_analysis(const Function& F)
+    {
+        for (const auto& bb_ref : F) {
+            auto bb = &bb_ref;
+            if (m_backedges.count(bb) == 0) {
+                // compute backedges of bb
+                m_backedges[bb] = {};
+                std::vector<const BasicBlock*> remote_succs { bb };
+                while (!remote_succs.empty()) {
+                    auto cur_succ = remote_succs.back();
+                    remote_succs.pop_back();
+                    for (const auto succ : successors(cur_succ)) {
+                        if (succ != bb && !m_backedges[bb].contains(succ)) {
+                            m_backedges[bb].insert(succ);
+                            remote_succs.push_back(succ);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     bool range_analysis(const Function& F)
     {
+        MKINT_LOG() << "Range Analysis -> " << F.getName();
         bool changed = false;
         // TODO: consider global symbols.
         std::vector<const BasicBlock*> worklist;
         worklist.push_back(&(F.getEntryBlock()));
 
-        std::map<const BasicBlock*, std::map<const Instruction*, crange>> bb_range;
+        std::map<const BasicBlock*, std::map<const Value*, crange>> bb_range;
+
+        for (const auto& arg : F.args()) {
+            if (arg.getType()->isIntegerTy()) {
+                bb_range[&(F.getEntryBlock())][&arg] = crange(arg.getType()->getIntegerBitWidth());
+            }
+        }
 
         while (!worklist.empty()) {
             auto bb = worklist.back();
             worklist.pop_back();
 
+            auto& cur_rng = bb_range[bb];
+
+            // merge all incoming bbs
+            for (const auto& pred : predecessors(bb)) {
+                // avoid backedge: pred can't be a successor of bb.
+                if (m_backedges[bb].contains(pred)) {
+                    continue; // skip backedge
+                }
+
+                for (const auto& inst : pred->getInstList()) {
+                    if (auto it = cur_rng.find(&inst); it == cur_rng.cend()) { // not found
+                        cur_rng[&inst] = bb_range[pred][&inst];
+                    } else { // merge
+                        it->second = it->second.unionWith(bb_range[pred][&inst]);
+                    }
+                }
+            }
+
             for (auto& inst : bb->getInstList()) {
-                if (auto op = dyn_cast<BinaryOperator>(&inst)) {
+                if (const BinaryOperator* op = dyn_cast<BinaryOperator>(&inst)) {
                     auto lhs = op->getOperand(0);
                     auto rhs = op->getOperand(1);
 
                     crange lhs_range {}, rhs_range {};
                     if (auto lconst = dyn_cast<ConstantInt>(lhs)) {
                         lhs_range = crange(lconst->getValue());
-                    } else if (auto linst = dyn_cast<Instruction>(lhs)) {
-                        lhs_range = bb_range[bb][linst];
                     } else {
-                        MKINT_CHECK_ABORT(false) << "Unknown operand type: " << lhs->getName();
+                        if (bb_range[bb].count(lhs) == 0) {
+                            std::string str;
+                            llvm::raw_string_ostream(str) << *lhs << " in " << inst;
+                            MKINT_CHECK_ABORT(false) << "Unknown operand type: " << str;
+                        }
+                        lhs_range = bb_range[bb][lhs];
                     }
 
                     if (auto rconst = dyn_cast<ConstantInt>(rhs)) {
                         rhs_range = crange(rconst->getValue());
-                    } else if (auto rinst = dyn_cast<Instruction>(rhs)) {
-                        rhs_range = bb_range[bb][rinst];
                     } else {
-                        MKINT_CHECK_ABORT(false) << "Unknown operand type: " << lhs->getName();
+                        if (bb_range[bb].count(rhs) == 0) {
+                            std::string str;
+                            llvm::raw_string_ostream(str) << *rhs << " in " << inst;
+                            MKINT_CHECK_ABORT(false) << "Unknown operand type: " << str;
+                        }
+                        rhs_range = bb_range[bb][rhs];
                     }
 
                     bb_range[bb][&inst] = compute_range(op, lhs_range, rhs_range);
@@ -337,9 +390,19 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             rinfo.init(F);
         }
 
+        for (auto& F : M) {
+            if (!F.isDeclaration()) {
+                backedge_analysis(F);
+            }
+        }
+
         while (true) { // iterative range analysis.
             bool changed = false;
             for (auto& F : M) {
+                if (F.isDeclaration()) {
+                    MKINT_LOG() << "Skip range analysis for declaration func: " << F.getName();
+                    continue;
+                }
                 changed |= range_analysis(F);
             }
             if (!changed)
@@ -357,6 +420,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 private:
     MapVector<StringRef, std::vector<Instruction*>> m_func2tsrc;
     std::map<Function*, func_range_info> m_func2range_info;
+    std::map<const BasicBlock*, SetVector<const BasicBlock*>> m_backedges;
 };
 } // namespace
 
