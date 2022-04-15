@@ -14,9 +14,14 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=1
 
 - [x] (Basic::Logger) add logger library for debugging and checking;
 - [x] (Basic::Z3) integrate Z3 environment in CMake;
-- [ ] (Feature::TaintAnalysis) Taint/sink annotation and broadcasting (WIP)
+- [x] (Feature::TaintAnalysis) Taint/sink annotation and broadcasting (WIP)
   - [x] Taint source and sink mark;
-  - [ ] Taint broadcasting;
+  - [x] Taint broadcasting;
+- [ ] Per-function range analysis;
+  - [x] Binary operator;
+  - [ ] Unary operator;
+  - [ ] Casting (if have time);
+- [ ] Constraint collection;
 
 ## Bound checking
 

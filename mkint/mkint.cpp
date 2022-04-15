@@ -1,12 +1,16 @@
 #include "log.hpp"
 #include "smt.hpp"
 
-#include <llvm-14/llvm/ADT/MapVector.h>
-#include <llvm-14/llvm/ADT/StringRef.h>
-#include <llvm-14/llvm/IR/Function.h>
+#include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/SetVector.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/ADT/StringRef.h>
+#include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/ConstantRange.h>
 #include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Metadata.h>
@@ -16,8 +20,15 @@
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/raw_ostream.h>
 
+#include <z3++.h>
+
 #include <array>
+#include <cassert>
+#include <cstdint>
 #include <iostream>
+#include <limits>
+#include <map>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -40,7 +51,40 @@ template <typename V, typename... Vs> static constexpr std::array<V, sizeof...(V
 constexpr auto MKINT_SINKS = mkarray<std::pair<std::string_view, size_t>>(
     std::pair { "kmalloc", 0 }, std::pair { "kzalloc", 0 }, std::pair { "vmalloc", 0 });
 
+struct crange : public ConstantRange {
+    /// https://llvm.org/doxygen/classllvm_1_1ConstantRange.html
+    using ConstantRange::ConstantRange;
+
+    crange(uint32_t bw) // by default we assume it's full set.
+        : ConstantRange(bw, true)
+    {
+    }
+
+    crange(const ConstantRange& cr)
+        : ConstantRange(cr)
+    {
+    }
+
+    crange()
+        : ConstantRange(0, true)
+    {
+    }
+};
+
 namespace {
+
+struct func_range_info {
+    SmallVector<crange, 4> arg_ranges;
+    crange ret_range;
+    std::map<BasicBlock*, std::map<Instruction*, crange>> bb_ranges;
+
+    void init(const Function& F)
+    {
+        for (auto& arg : F.args()) {
+            arg_ranges.push_back(crange(arg.getType()->getIntegerBitWidth()));
+        }
+    }
+};
 
 enum class interr {
     OUT_OF_BOUND,
@@ -175,38 +219,106 @@ static void mark_func_sinks(Function& F)
     }
 }
 
+crange compute_range(const BinaryOperator* op, crange lhs, crange rhs)
+{
+    if (lhs.getBitWidth() < rhs.getBitWidth()) {
+        lhs = lhs.zextOrTrunc(lhs.getBitWidth());
+    } else if (lhs.getBitWidth() > rhs.getBitWidth()) {
+        rhs = rhs.zextOrTrunc(rhs.getBitWidth());
+    }
+
+    switch (op->getOpcode()) {
+    case Instruction::Add:
+        return lhs.add(rhs);
+    case Instruction::Sub:
+        return lhs.sub(rhs);
+    case Instruction::Mul:
+        return lhs.multiply(rhs);
+    case Instruction::UDiv:
+        return lhs.udiv(rhs);
+    case Instruction::SDiv:
+        return lhs.sdiv(rhs);
+    case Instruction::Shl:
+        return lhs.shl(rhs);
+    case Instruction::LShr:
+        return lhs.lshr(rhs);
+    case Instruction::AShr:
+        return lhs.ashr(rhs);
+    case Instruction::And:
+        return lhs.binaryAnd(rhs);
+    case Instruction::Or:
+        return lhs.binaryOr(rhs);
+    case Instruction::Xor:
+        return lhs.binaryXor(rhs);
+    case Instruction::URem:
+        return lhs.urem(rhs);
+    case Instruction::SRem:
+        return lhs.srem(rhs);
+    }
+
+    MKINT_LOG() << "Unhandled opcode: " << op->getOpcodeName();
+
+    return rhs;
+}
+
 struct MKintPass : public PassInfoMixin<MKintPass> {
-    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM)
+    void taint_analysis(Function& F)
     {
-        MKINT_LOG() << "Running MKint pass on function " << F.getName();
-
-        auto& ctx = F.getContext();
-
-        // MiniPass 1: Mark (source) taint/sink;
+        MKINT_LOG() << "Taint Analysis -> " << F.getName();
+        // Mark (source) taint/sink;
         // * Note we must do this first b.c. this is a write pass.
         // * the remaining stuff will at most add some metadata.
         auto taint_sources = get_taint_source(F);
         // for now, the taint_source are not marked as taint.
         // because we only mark taints if sinks are reachable for a certain taint candidate.
         mark_func_sinks(F);
-
-        // MiniPass 2: Broadcast taint;
         taint_broadcasting(taint_sources);
-        // TODO: MiniPass 3: Collect constraints;
-
-        // TODO: -> Move to module pass!
-        // TODO: MiniPass 4: Traverse the paths and solve constraints;
-        // TODO:           : Add mkint.err label if violation detected.
-
-        // FIXME: This is some dummy code to test.
-        // auto&& bb = F.getEntryBlock();
-        // for (auto& inst : bb) {
-        //     mark_err<interr::OUT_OF_BOUND>(inst);
-        // }
 
         if (!taint_sources.empty())
             m_func2tsrc[F.getName()] = std::move(taint_sources);
-        return PreservedAnalyses::all(); // TODO: I actually cannot tell which analysis are preserved.
+    }
+
+    bool range_analysis(const Function& F)
+    {
+        bool changed = false;
+        // TODO: consider global symbols.
+        std::vector<const BasicBlock*> worklist;
+        worklist.push_back(&(F.getEntryBlock()));
+
+        std::map<const BasicBlock*, std::map<const Instruction*, crange>> bb_range;
+
+        while (!worklist.empty()) {
+            auto bb = worklist.back();
+            worklist.pop_back();
+
+            for (auto& inst : bb->getInstList()) {
+                if (auto op = dyn_cast<BinaryOperator>(&inst)) {
+                    auto lhs = op->getOperand(0);
+                    auto rhs = op->getOperand(1);
+
+                    crange lhs_range {}, rhs_range {};
+                    if (auto lconst = dyn_cast<ConstantInt>(lhs)) {
+                        lhs_range = crange(lconst->getValue());
+                    } else if (auto linst = dyn_cast<Instruction>(lhs)) {
+                        lhs_range = bb_range[bb][linst];
+                    } else {
+                        MKINT_CHECK_ABORT(false) << "Unknown operand type: " << lhs->getName();
+                    }
+
+                    if (auto rconst = dyn_cast<ConstantInt>(rhs)) {
+                        rhs_range = crange(rconst->getValue());
+                    } else if (auto rinst = dyn_cast<Instruction>(rhs)) {
+                        rhs_range = bb_range[bb][rinst];
+                    } else {
+                        MKINT_CHECK_ABORT(false) << "Unknown operand type: " << lhs->getName();
+                    }
+
+                    bb_range[bb][&inst] = compute_range(op, lhs_range, rhs_range);
+                }
+            }
+        }
+
+        return changed;
     }
 
     PreservedAnalyses run(Module& M, ModuleAnalysisManager& MAM)
@@ -214,20 +326,37 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         MKINT_LOG() << "Running MKint pass on module " << M.getName();
 
         for (auto& F : M) {
-            run(F, MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager());
+            taint_analysis(F);
         } // no writes anymore (except writing metadata).
+
+        constexpr size_t max_try = 128;
+        size_t try_count = 0;
+        // initialize range ananlysis
+        for (auto& F : M) {
+            auto& rinfo = m_func2range_info[&F];
+            rinfo.init(F);
+        }
+
+        while (true) { // iterative range analysis.
+            bool changed = false;
+            for (auto& F : M) {
+                changed |= range_analysis(F);
+            }
+            if (!changed)
+                break;
+            if (++try_count > max_try) {
+                MKINT_LOG() << "[Iterative Range Analysis] "
+                            << "Max try " << max_try << " reached, aborting.";
+                break;
+            }
+        }
 
         return PreservedAnalyses::all();
     }
 
-    void glob_symbols_constraints(const Function& F)
-    {
-        // build symbols for each (tainted) instruction;
-        // collect basic constraints.
-    }
-
 private:
     MapVector<StringRef, std::vector<Instruction*>> m_func2tsrc;
+    std::map<Function*, func_range_info> m_func2range_info;
 };
 } // namespace
 
