@@ -1,5 +1,10 @@
 // http://git.gnome.org/browse/evolution-data-server/commit/camel/camel-lock-helper.c?id=0d1d403fab78b869867d50fcc6ee95f503925318
 
+// RUN: clang %s -O0 -S -emit-llvm -o %t.ll
+// RUN: opt -load %builddir/mkint/ -mkint-pass %t.ll -S -o %t.out.ll
+// RUN: AFTER=%t.out.ll python3 %testdir/llvm_lite.py
+
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -54,7 +59,7 @@ int main()
 		case CAMEL_LOCK_HELPER_LOCK:
 			res = CAMEL_LOCK_HELPER_STATUS_NOMEM;
 			path = (gchar *)malloc(msg.data+1); // overflow may happen, should check data is not too large
-				if (path != NULL) {
+			if (path != NULL) {
 				res = CAMEL_LOCK_HELPER_STATUS_PROTOCOL;
 				len = read_n(STDIN_FILENO, path, msg.data);
 				if (len == msg.data) {
