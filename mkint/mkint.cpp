@@ -1,9 +1,16 @@
 #include "log.hpp"
 #include "smt.hpp"
 
+#include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/SetVector.h>
 #include <llvm/ADT/SmallVector.h>
+#include <llvm/ADT/StringRef.h>
+#include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/ConstantRange.h>
 #include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Metadata.h>
@@ -13,8 +20,15 @@
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/raw_ostream.h>
 
+#include <z3++.h>
+
 #include <array>
+#include <cassert>
+#include <cstdint>
 #include <iostream>
+#include <limits>
+#include <map>
+#include <optional>
 #include <string_view>
 #include <type_traits>
 #include <utility>
@@ -37,7 +51,29 @@ template <typename V, typename... Vs> static constexpr std::array<V, sizeof...(V
 constexpr auto MKINT_SINKS = mkarray<std::pair<std::string_view, size_t>>(
     std::pair { "kmalloc", 0 }, std::pair { "kzalloc", 0 }, std::pair { "vmalloc", 0 });
 
+struct crange : public ConstantRange {
+    /// https://llvm.org/doxygen/classllvm_1_1ConstantRange.html
+    using ConstantRange::ConstantRange;
+
+    crange(uint32_t bw) // by default we assume it's full set.
+        : ConstantRange(bw, true)
+    {
+    }
+
+    crange(const ConstantRange& cr)
+        : ConstantRange(cr)
+    {
+    }
+
+    crange()
+        : ConstantRange(0, true)
+    {
+    }
+};
+
 namespace {
+
+using bbrange_t = std::map<const BasicBlock*, std::map<const Value*, crange>>;
 
 enum class interr {
     OUT_OF_BOUND,
@@ -86,7 +122,7 @@ static std::vector<Instruction*> get_taint_source(Function& F)
     std::vector<Instruction*> ret;
     // judge if this function is the taint source.
     const auto name = F.getName();
-    if (name.startswith("sys_") || name.startswith("__mkint_ann_")) {
+    if (name.startswith("sys_") || (name.startswith("__mkint_ann_") && !name.contains(".mkint.arg"))) {
         // mark all this function as a taint source.
         // Unfortunately arguments cannot be marked with metadata...
         // We need to rewrite the arguments -> unary callers and mark the callers.
@@ -144,7 +180,7 @@ static void taint_broadcasting(const std::vector<Instruction*>& taint_source)
 
     for (auto ts : taint_source) {
         if (is_sink_reachable(ts)) {
-            mark_taint(*ts);
+            mark_taint(*ts, "source");
         }
     }
 }
@@ -172,37 +208,207 @@ static void mark_func_sinks(Function& F)
     }
 }
 
+crange compute_range(const BinaryOperator* op, crange lhs, crange rhs)
+{
+    if (lhs.getBitWidth() < rhs.getBitWidth()) {
+        lhs = lhs.zextOrTrunc(lhs.getBitWidth());
+    } else if (lhs.getBitWidth() > rhs.getBitWidth()) {
+        rhs = rhs.zextOrTrunc(rhs.getBitWidth());
+    }
+
+    switch (op->getOpcode()) {
+    case Instruction::Add:
+        return lhs.add(rhs);
+    case Instruction::Sub:
+        return lhs.sub(rhs);
+    case Instruction::Mul:
+        return lhs.multiply(rhs);
+    case Instruction::UDiv:
+        return lhs.udiv(rhs);
+    case Instruction::SDiv:
+        return lhs.sdiv(rhs);
+    case Instruction::Shl:
+        return lhs.shl(rhs);
+    case Instruction::LShr:
+        return lhs.lshr(rhs);
+    case Instruction::AShr:
+        return lhs.ashr(rhs);
+    case Instruction::And:
+        return lhs.binaryAnd(rhs);
+    case Instruction::Or:
+        return lhs.binaryOr(rhs);
+    case Instruction::Xor:
+        return lhs.binaryXor(rhs);
+    case Instruction::URem:
+        return lhs.urem(rhs);
+    case Instruction::SRem:
+        return lhs.srem(rhs);
+    }
+
+    MKINT_LOG() << "Unhandled opcode: " << op->getOpcodeName();
+
+    return rhs;
+}
+
 struct MKintPass : public PassInfoMixin<MKintPass> {
-    PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM)
+    void taint_analysis(Function& F)
     {
-        MKINT_LOG() << "Running MKint pass on function " << F.getName();
-
-        auto& ctx = F.getContext();
-
-        // MiniPass 1: Mark (source) taint/sink;
+        MKINT_LOG() << "Taint Analysis -> " << F.getName();
+        // Mark (source) taint/sink;
         // * Note we must do this first b.c. this is a write pass.
         // * the remaining stuff will at most add some metadata.
         auto taint_sources = get_taint_source(F);
         // for now, the taint_source are not marked as taint.
         // because we only mark taints if sinks are reachable for a certain taint candidate.
         mark_func_sinks(F);
-
-        // MiniPass 2: Broadcast taint;
         taint_broadcasting(taint_sources);
-        // TODO: MiniPass 3: Collect constraints;
 
-        // TODO: -> Move to module pass!
-        // TODO: MiniPass 4: Traverse the paths and solve constraints;
-        // TODO:           : Add mkint.err label if violation detected.
-
-        // FIXME: This is some dummy code to test.
-        // auto&& bb = F.getEntryBlock();
-        // for (auto& inst : bb) {
-        //     mark_err<interr::OUT_OF_BOUND>(inst);
-        // }
-
-        return PreservedAnalyses::all(); // TODO: I actually cannot tell which analysis are preserved.
+        if (!taint_sources.empty())
+            m_func2tsrc[F.getName()] = std::move(taint_sources);
     }
+
+    void backedge_analysis(const Function& F)
+    {
+        for (const auto& bb_ref : F) {
+            auto bb = &bb_ref;
+            if (m_backedges.count(bb) == 0) {
+                // compute backedges of bb
+                m_backedges[bb] = {};
+                std::vector<const BasicBlock*> remote_succs { bb };
+                while (!remote_succs.empty()) {
+                    auto cur_succ = remote_succs.back();
+                    remote_succs.pop_back();
+                    for (const auto succ : successors(cur_succ)) {
+                        if (succ != bb && !m_backedges[bb].contains(succ)) {
+                            m_backedges[bb].insert(succ);
+                            remote_succs.push_back(succ);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    bool range_analysis(const Function& F)
+    {
+        MKINT_LOG() << "Range Analysis -> " << F.getName();
+        bool changed = false;
+        // TODO: consider global symbols.
+        std::vector<const BasicBlock*> worklist;
+        worklist.push_back(&(F.getEntryBlock()));
+
+        auto& bb_range = m_func2range_info[&F];
+
+        for (const auto& arg : F.args()) {
+            if (arg.getType()->isIntegerTy() && bb_range[&(F.getEntryBlock())].count(&arg) == 0) {
+                bb_range[&(F.getEntryBlock())][&arg] = crange(arg.getType()->getIntegerBitWidth());
+            }
+        }
+
+        while (!worklist.empty()) {
+            auto bb = worklist.back();
+            worklist.pop_back();
+
+            auto& cur_rng = bb_range[bb];
+
+            // merge all incoming bbs
+            for (const auto& pred : predecessors(bb)) {
+                // avoid backedge: pred can't be a successor of bb.
+                if (m_backedges[bb].contains(pred)) {
+                    continue; // skip backedge
+                }
+
+                for (const auto& inst : pred->getInstList()) {
+                    if (auto it = cur_rng.find(&inst); it == cur_rng.cend()) { // not found
+                        cur_rng[&inst] = bb_range[pred][&inst];
+                    } else { // merge
+                        it->second = it->second.unionWith(bb_range[pred][&inst]);
+                    }
+                }
+            }
+
+            // TODO: check pred branch for conditions.
+
+            for (auto& inst : bb->getInstList()) {
+                const auto get_rng = [&bb_range, &bb, &inst](auto var) {
+                    if (auto lconst = dyn_cast<ConstantInt>(var)) {
+                        return crange(lconst->getValue());
+                    } else {
+                        if (bb_range[bb].count(var) == 0) {
+                            std::string str;
+                            llvm::raw_string_ostream(str) << *var << " in " << inst;
+                            MKINT_CHECK_ABORT(false) << "Unknown operand type: " << str;
+                        }
+                        return bb_range[bb][var];
+                    }
+                };
+                // TODO: handle void types:
+                // Store / Call / Return
+
+                // return type should be int
+                if (!inst.getType()->isIntegerTy()) {
+                    continue;
+                }
+
+                crange new_range;
+
+                if (const BinaryOperator* op = dyn_cast<BinaryOperator>(&inst)) {
+                    auto lhs = op->getOperand(0);
+                    auto rhs = op->getOperand(1);
+
+                    crange lhs_range = get_rng(lhs), rhs_range = get_rng(rhs);
+                    new_range = compute_range(op, lhs_range, rhs_range);
+                }
+
+                bb_range[bb][&inst] = bb_range[bb][&inst].unionWith(new_range);
+            }
+        }
+
+        return changed;
+    }
+
+    PreservedAnalyses run(Module& M, ModuleAnalysisManager& MAM)
+    {
+        MKINT_LOG() << "Running MKint pass on module " << M.getName();
+
+        for (auto& F : M) {
+            taint_analysis(F);
+        } // no writes anymore (except writing metadata).
+
+        constexpr size_t max_try = 128;
+        size_t try_count = 0;
+
+        for (auto& F : M) {
+            if (!F.isDeclaration()) {
+                backedge_analysis(F);
+            }
+        }
+
+        while (true) { // iterative range analysis.
+            bool changed = false;
+            for (auto& F : M) {
+                if (F.isDeclaration()) {
+                    MKINT_LOG() << "Skip range analysis for declaration func: " << F.getName();
+                    continue;
+                }
+                changed |= range_analysis(F);
+            }
+            if (!changed)
+                break;
+            if (++try_count > max_try) {
+                MKINT_LOG() << "[Iterative Range Analysis] "
+                            << "Max try " << max_try << " reached, aborting.";
+                break;
+            }
+        }
+
+        return PreservedAnalyses::all();
+    }
+
+private:
+    MapVector<StringRef, std::vector<Instruction*>> m_func2tsrc;
+    std::map<const Function*, bbrange_t> m_func2range_info;
+    std::map<const BasicBlock*, SetVector<const BasicBlock*>> m_backedges;
 };
 } // namespace
 
@@ -211,9 +417,9 @@ extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK llvmGetPassPluginIn
 {
     return { LLVM_PLUGIN_API_VERSION, "MKintPass", "v0.1", [](PassBuilder& PB) {
                 PB.registerPipelineParsingCallback(
-                    [](StringRef Name, FunctionPassManager& FPM, ArrayRef<PassBuilder::PipelineElement>) {
+                    [](StringRef Name, ModulePassManager& MPM, ArrayRef<PassBuilder::PipelineElement>) {
                         if (Name == "mkint-pass") {
-                            FPM.addPass(MKintPass());
+                            MPM.addPass(MKintPass());
                             return true;
                         }
                         return false;
