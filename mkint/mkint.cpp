@@ -1,6 +1,8 @@
 #include "log.hpp"
 #include "smt.hpp"
 
+#include <cxxabi.h>
+
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/SetVector.h>
@@ -43,12 +45,19 @@ constexpr const char* MKINT_IR_TAINT = "mkint.taint";
 constexpr const char* MKINT_IR_SINK = "mkint.sink";
 constexpr const char* MKINT_IR_ERR = "mkint.err";
 
+static std::string demangle(const char* name)
+{
+    int status = -1;
+    std::unique_ptr<char, void (*)(void*)> res { abi::__cxa_demangle(name, NULL, NULL, &status), std::free };
+    return (status == 0) ? res.get() : std::string(name);
+}
+
 template <typename V, typename... Vs> static constexpr std::array<V, sizeof...(Vs)> mkarray(Vs&&... vs) noexcept
 {
     return std::array<V, sizeof...(Vs)> { vs... };
 }
 
-constexpr auto MKINT_SINKS = mkarray<std::pair<std::string_view, size_t>>(
+constexpr auto MKINT_SINKS = mkarray<std::pair<const char*, size_t>>(
     std::pair { "kmalloc", 0 }, std::pair { "kzalloc", 0 }, std::pair { "vmalloc", 0 });
 
 struct crange : public ConstantRange {
@@ -121,7 +130,8 @@ static std::vector<Instruction*> get_taint_source(Function& F)
 {
     std::vector<Instruction*> ret;
     // judge if this function is the taint source.
-    const auto name = F.getName();
+    const auto demangled_name = demangle(F.getName().str().c_str());
+    const auto name = StringRef(demangled_name);
     if (name.startswith("sys_") || (name.startswith("__mkint_ann_") && !name.contains(".mkint.arg"))) {
         // mark all this function as a taint source.
         // Unfortunately arguments cannot be marked with metadata...
@@ -197,7 +207,8 @@ static void mark_func_sinks(Function& F)
         if (auto* call = dyn_cast<CallInst>(&inst)) {
             // call in MKINT_SINKS
             for (const auto& [name, idx] : MKINT_SINKS) {
-                if (call->getCalledFunction()->getName().startswith(name)) {
+                const auto demangled_func_name = demangle(call->getCalledFunction()->getName().str().c_str());
+                if (StringRef(demangled_func_name).startswith(name)) {
                     if (auto inst = dyn_cast_or_null<Instruction>(call->getArgOperand(idx))) {
                         mark_sink(*inst, name);
                     }
