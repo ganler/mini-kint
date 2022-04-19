@@ -229,7 +229,7 @@ std::pair<crange, crange> auto_promote(crange lhs, crange rhs)
     return std::make_pair(lhs, rhs);
 }
 
-crange compute_range(const BinaryOperator* op, crange lhs_, crange rhs_)
+crange compute_binary_rng(const BinaryOperator* op, crange lhs_, crange rhs_)
 {
 
     auto [lhs, rhs] = auto_promote(std::move(lhs_), std::move(rhs_));
@@ -375,7 +375,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                     auto rhs = op->getOperand(1);
 
                     crange lhs_range = get_rng(lhs), rhs_range = get_rng(rhs);
-                    new_range = compute_range(op, lhs_range, rhs_range);
+                    new_range = compute_binary_rng(op, lhs_range, rhs_range);
                     // NOTE: LLVM is not a fan of unary operators.
                     //       -x is represented by 0 - x...
                 } else if (const SelectInst* op = dyn_cast<SelectInst>(&inst)) {
@@ -394,6 +394,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                             return inprng.zeroExtend(bits);
                         case CastInst::SExt:
                             return inprng.signExtend(bits); // FIXME: Crash on M1 Mac?
+                                                            // But it is not a problem on Linux.
                         default:
                             MKINT_LOG() << "Unhandled Cast Instruction " << op->getOpcodeName()
                                         << ". Using original range.";
