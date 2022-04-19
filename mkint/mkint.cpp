@@ -82,7 +82,7 @@ struct crange : public ConstantRange {
 
 namespace {
 
-using bbrange_t = std::map<const BasicBlock*, std::map<const Value*, crange>>;
+using bbrange_t = DenseMap<const BasicBlock*, DenseMap<const Value*, crange>>;
 
 enum class interr {
     OUT_OF_BOUND,
@@ -219,7 +219,8 @@ static void mark_func_sinks(Function& F)
     }
 }
 
-std::pair<crange, crange> auto_promote(crange lhs, crange rhs) {
+std::pair<crange, crange> auto_promote(crange lhs, crange rhs)
+{
     if (lhs.getBitWidth() < rhs.getBitWidth()) {
         lhs = lhs.zextOrTrunc(lhs.getBitWidth());
     } else if (lhs.getBitWidth() > rhs.getBitWidth()) {
@@ -260,9 +261,9 @@ crange compute_range(const BinaryOperator* op, crange lhs_, crange rhs_)
         return lhs.urem(rhs);
     case Instruction::SRem:
         return lhs.srem(rhs);
+    default:
+        MKINT_LOG() << "Unhandled binary opcode: " << op->getOpcodeName();
     }
-
-    MKINT_LOG() << "Unhandled opcode: " << op->getOpcodeName();
 
     return rhs;
 }
@@ -336,7 +337,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 }
 
                 for (const auto& inst : pred->getInstList()) {
-                    if (auto it = cur_rng.find(&inst); it == cur_rng.cend()) { // not found
+                    if (auto it = cur_rng.find(&inst); it == cur_rng.end()) { // not found
                         cur_rng[&inst] = bb_range[pred][&inst];
                     } else { // merge
                         it->second = it->second.unionWith(bb_range[pred][&inst]);
@@ -347,7 +348,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             // TODO: check pred branch for conditions.
 
             for (auto& inst : bb->getInstList()) {
-                const auto get_rng = [&bb_range, &bb, &inst](auto var) {
+                const auto get_rng = [&bb_range, &bb, &inst](auto var) -> crange {
                     if (auto lconst = dyn_cast<ConstantInt>(var)) {
                         return crange(lconst->getValue());
                     } else {
@@ -375,11 +376,31 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
                     crange lhs_range = get_rng(lhs), rhs_range = get_rng(rhs);
                     new_range = compute_range(op, lhs_range, rhs_range);
+                    // NOTE: LLVM is not a fan of unary operators.
+                    //       -x is represented by 0 - x...
                 } else if (const SelectInst* op = dyn_cast<SelectInst>(&inst)) {
                     const auto tval = op->getTrueValue();
                     const auto fval = op->getFalseValue();
                     auto [lhs, rhs] = auto_promote(get_rng(tval), get_rng(fval));
                     new_range = lhs.unionWith(rhs);
+                } else if (const CastInst* op = dyn_cast<CastInst>(&inst)) {
+                    new_range = [op, &get_rng]() -> crange {
+                        auto inprng = get_rng(op->getOperand(0));
+                        const uint32_t bits = op->getType()->getIntegerBitWidth();
+                        switch (op->getOpcode()) {
+                        case CastInst::Trunc:
+                            return inprng.truncate(bits);
+                        case CastInst::ZExt:
+                            return inprng.zeroExtend(bits);
+                        case CastInst::SExt:
+                            return inprng.signExtend(bits); // FIXME: Crash on M1 Mac?
+                        default:
+                            MKINT_LOG() << "Unhandled Cast Instruction " << op->getOpcodeName()
+                                        << ". Using original range.";
+                        }
+
+                        return inprng;
+                    }();
                 }
 
                 bb_range[bb][&inst] = bb_range[bb][&inst].unionWith(new_range);
@@ -429,8 +450,8 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
 private:
     MapVector<StringRef, std::vector<Instruction*>> m_func2tsrc;
-    std::map<const Function*, bbrange_t> m_func2range_info;
-    std::map<const BasicBlock*, SetVector<const BasicBlock*>> m_backedges;
+    DenseMap<const Function*, bbrange_t> m_func2range_info;
+    DenseMap<const BasicBlock*, SetVector<const BasicBlock*>> m_backedges;
 };
 } // namespace
 
