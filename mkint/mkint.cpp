@@ -219,13 +219,19 @@ static void mark_func_sinks(Function& F)
     }
 }
 
-crange compute_range(const BinaryOperator* op, crange lhs, crange rhs)
-{
+std::pair<crange, crange> auto_promote(crange lhs, crange rhs) {
     if (lhs.getBitWidth() < rhs.getBitWidth()) {
         lhs = lhs.zextOrTrunc(lhs.getBitWidth());
     } else if (lhs.getBitWidth() > rhs.getBitWidth()) {
         rhs = rhs.zextOrTrunc(rhs.getBitWidth());
     }
+    return std::make_pair(lhs, rhs);
+}
+
+crange compute_range(const BinaryOperator* op, crange lhs_, crange rhs_)
+{
+
+    auto [lhs, rhs] = auto_promote(std::move(lhs_), std::move(rhs_));
 
     switch (op->getOpcode()) {
     case Instruction::Add:
@@ -369,6 +375,11 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
                     crange lhs_range = get_rng(lhs), rhs_range = get_rng(rhs);
                     new_range = compute_range(op, lhs_range, rhs_range);
+                } else if (const SelectInst* op = dyn_cast<SelectInst>(&inst)) {
+                    const auto tval = op->getTrueValue();
+                    const auto fval = op->getFalseValue();
+                    auto [lhs, rhs] = auto_promote(get_rng(tval), get_rng(fval));
+                    new_range = lhs.unionWith(rhs);
                 }
 
                 bb_range[bb][&inst] = bb_range[bb][&inst].unionWith(new_range);
