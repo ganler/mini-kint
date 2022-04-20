@@ -311,12 +311,12 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
     bool range_analysis(const Function& F)
     {
         MKINT_LOG() << "Range Analysis -> " << F.getName();
-        bool changed = false;
         // TODO: consider global symbols.
         std::vector<const BasicBlock*> worklist;
         worklist.push_back(&(F.getEntryBlock()));
 
         auto& bb_range = m_func2range_info[&F];
+        const auto old_rng = bb_range;
 
         for (const auto& arg : F.args()) {
             if (arg.getType()->isIntegerTy() && bb_range[&(F.getEntryBlock())].count(&arg) == 0) {
@@ -502,7 +502,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             }
         }
 
-        return changed;
+        return old_rng != bb_range; // changed
     }
 
     PreservedAnalyses run(Module& M, ModuleAnalysisManager& MAM)
