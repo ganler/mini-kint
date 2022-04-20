@@ -3,7 +3,7 @@
 
 #include <cxxabi.h>
 
-#include <llvm-14/llvm/IR/GlobalValue.h>
+#include <llvm/IR/GlobalValue.h>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/SetVector.h>
