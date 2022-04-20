@@ -42,12 +42,16 @@ Use SMT solver to determine if these are possible and mark plausible ones (**the
 
 Find out **observable** variables outside of current functions:
 
-- arguments;
-- function return value;
-- (mutable ) global variables;
+- Function arguments;
+- Function return value;
+- Global variables;
+- Range of observable variables for each block.
 
 Analyze their ranges and apply it in eventual solving.
 
 ## Taint Analysis
 
-Is this bug related to **untrusted input**. For simplicity we assume the input of main function is **untrusted input**.
+Is this bug related to **untrusted input**.
+
+- **Taint sources**: arguments of functions whose names start with `sys_` or `__mkint_ann_`.
+- **Sinks**: `kmalloc:0`, `kzalloc:0`, `vmalloc:0`, etc.
