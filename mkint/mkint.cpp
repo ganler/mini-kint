@@ -3,7 +3,6 @@
 
 #include <cxxabi.h>
 
-#include <llvm/IR/GlobalValue.h>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/SetVector.h>
@@ -13,6 +12,7 @@
 #include <llvm/IR/ConstantRange.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Function.h>
+#include <llvm/IR/GlobalValue.h>
 #include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
@@ -138,8 +138,7 @@ static std::vector<Instruction*> get_taint_source(Function& F)
 {
     std::vector<Instruction*> ret;
     // judge if this function is the taint source.
-    const auto demangled_name = demangle(F.getName().str().c_str());
-    const auto name = StringRef(demangled_name);
+    const auto name = F.getName();
     if (is_taint_src(name)) {
         // mark all this function as a taint source.
         // Unfortunately arguments cannot be marked with metadata...
@@ -320,24 +319,22 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
     void range_analysis(const Function& F)
     {
         MKINT_LOG() << "Range Analysis -> " << F.getName();
-        // TODO: consider global symbols.
-        std::vector<const BasicBlock*> worklist;
-        worklist.push_back(&(F.getEntryBlock()));
 
         auto& bb_range = m_func2range_info[&F];
 
-        while (!worklist.empty()) {
-            auto bb = worklist.back();
-            worklist.pop_back();
+        for (const auto& bbref : F) {
+            auto bb = &bbref;
 
             auto& cur_rng = bb_range[bb];
 
-            const auto get_range_by_bb = [&bb_range](auto var, const BasicBlock* bb) {
+            const auto get_range_by_bb = [this, &bb_range](auto var, const BasicBlock* bb) -> crange {
                 // FIXME: check global var.
                 if (auto lconst = dyn_cast<ConstantInt>(var)) {
                     return crange(lconst->getValue());
                 } else {
                     if (bb_range[bb].count(var) == 0) {
+                        if (auto gv = dyn_cast<GlobalVariable>(var))
+                            return m_global2range[gv];
                         MKINT_CHECK_ABORT(false) << "Unknown operand type: " << *var;
                     }
                     return bb_range[bb][var];
@@ -369,7 +366,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                                 continue;
                             }
 
-                            auto trng = get_range_by_bb(lhs, bb), frng = get_range_by_bb(rhs, bb);
+                            auto trng = get_range_by_bb(lhs, pred), frng = get_range_by_bb(rhs, pred);
 
                             if (cur_rng.count(lhs) == 0)
                                 cur_rng[lhs] = crange::getEmpty(lhs->getType()->getIntegerBitWidth());
@@ -465,7 +462,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                                 argblock[&arg] = argblock[&arg].unionWith(get_rng(call->getArgOperand(arg.getArgNo())));
                         }
 
-                        if (!f->getType()->isIntegerTy()) // return value is integer.
+                        if (!f->getReturnType()->isIntegerTy()) // return value is integer.
                             continue;
                         // low precision: just apply!
                         cur_rng[call] = m_func2ret_range[f];
@@ -486,9 +483,10 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 } else if (const auto ret = dyn_cast<ReturnInst>(&inst)) {
                     // low precision: just apply!
                     if (F.getReturnType()->isIntegerTy()) {
-                        m_func2ret_range[&F] = m_func2ret_range[&F].unionWith(get_rng(ret->getReturnValue()));
-                        MKINT_LOG() << "Func: " << F.getName() << " -> " << m_func2ret_range[&F];
+                        m_func2ret_range[&F] = get_rng(ret->getReturnValue()).unionWith(m_func2ret_range[&F]);
+                        MKINT_LOG() << "Range of fn " << F.getName() << " -> " << m_func2ret_range[&F];
                     }
+                    continue;
                 }
 
                 // return type should be int
@@ -533,6 +531,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 }
 
                 cur_rng[&inst] = cur_rng[&inst].unionWith(new_range);
+                MKINT_LOG() << "Range of " << inst << " -> " << cur_rng[&inst];
             }
         }
     }
@@ -585,7 +584,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                     MKINT_LOG() << "Skip range analysis for func w/o impl: " << F.getName();
                 } else {
                     if (F.getReturnType()->isIntegerTy())
-                        m_func2ret_range[&F] = crange::getEmpty(F.getReturnType()->getIntegerBitWidth());
+                        m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), false); // empty.
 
                     // init the arg range
                     auto& init_blk = m_func2range_info[&F][&(F.getEntryBlock())];
