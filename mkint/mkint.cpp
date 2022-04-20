@@ -572,11 +572,13 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                         }
                         new_range = new_range.unionWith(get_range_by_bb(op->getIncomingValue(i), pred));
                     }
+                } else if (const auto op = dyn_cast<LoadInst>(&inst)) {
+                    new_range = get_rng(op->getPointerOperand());
                 } else {
                     MKINT_CHECK_RELAX(false) << " [Range Analysis] Unhandled instruction: " << inst;
                 }
 
-                cur_rng[&inst] = cur_rng[&inst].unionWith(new_range);
+                cur_rng[&inst] = new_range.unionWith(cur_rng[&inst]);
             }
         }
     }
@@ -660,7 +662,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 if (GV.hasInitializer()) {
                     auto init_val = dyn_cast<ConstantInt>(GV.getInitializer())->getValue();
                     MKINT_LOG() << GV.getName() << " init by " << init_val;
-                    m_global2range[&GV] = crange();
+                    m_global2range[&GV] = crange(init_val);
                 } else {
                     m_global2range[&GV] = crange(GV.getType()->getIntegerBitWidth()); // can be all range.
                 }
