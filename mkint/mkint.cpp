@@ -3,7 +3,7 @@
 
 #include <cxxabi.h>
 
-#include <llvm/IR/Value.h>
+#include <llvm-14/llvm/IR/GlobalValue.h>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/SetVector.h>
@@ -18,6 +18,7 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Metadata.h>
 #include <llvm/IR/PassManager.h>
+#include <llvm/IR/Value.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/PassPlugin.h>
 #include <llvm/Support/Casting.h>
@@ -127,13 +128,20 @@ static void mark_taint(Instruction& inst, std::string_view taint_name = "")
     inst.setMetadata(MKINT_IR_TAINT, md);
 }
 
+static bool is_taint_src(StringRef sv)
+{
+    const auto demangled_name = demangle(sv.str().c_str());
+    const auto name = StringRef(demangled_name);
+    return name.startswith("sys_") || name.startswith("__mkint_ann_");
+}
+
 static std::vector<Instruction*> get_taint_source(Function& F)
 {
     std::vector<Instruction*> ret;
     // judge if this function is the taint source.
     const auto demangled_name = demangle(F.getName().str().c_str());
     const auto name = StringRef(demangled_name);
-    if (name.startswith("sys_") || (name.startswith("__mkint_ann_") && !name.contains(".mkint.arg"))) {
+    if (is_taint_src(name)) {
         // mark all this function as a taint source.
         // Unfortunately arguments cannot be marked with metadata...
         // We need to rewrite the arguments -> unary callers and mark the callers.
@@ -152,6 +160,8 @@ static std::vector<Instruction*> get_taint_source(Function& F)
     }
     return ret;
 }
+
+static bool is_taint_src_arg_call(StringRef s) { return s.contains(".mkint.arg"); }
 
 static bool is_sink_reachable(Instruction* inst)
 {
@@ -320,7 +330,12 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
         for (const auto& arg : F.args()) {
             if (arg.getType()->isIntegerTy() && bb_range[&(F.getEntryBlock())].count(&arg) == 0) {
-                bb_range[&(F.getEntryBlock())][&arg] = crange(arg.getType()->getIntegerBitWidth());
+                // be conservative first.
+                if (is_taint_src(F.getName())) { // for taint source, we assume full set.
+                    bb_range[&(F.getEntryBlock())][&arg] = crange(arg.getType()->getIntegerBitWidth(), true);
+                } else {
+                    bb_range[&(F.getEntryBlock())][&arg] = crange(arg.getType()->getIntegerBitWidth(), false);
+                }
             }
         }
 
@@ -331,6 +346,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             auto& cur_rng = bb_range[bb];
 
             const auto get_range_by_bb = [&bb_range](auto var, const BasicBlock* bb) {
+                // FIXME: check global var.
                 if (auto lconst = dyn_cast<ConstantInt>(var)) {
                     return crange(lconst->getValue());
                 } else {
@@ -350,7 +366,6 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
                 SetVector<const Value*> narrowed_insts;
 
-                // TODO: check pred branch for conditions.
                 // branch or switch
                 // NOTE: branch should be used to narrow the range.
                 if (auto terminator = pred->getTerminator(); auto br = dyn_cast<BranchInst>(terminator)) {
@@ -454,8 +469,34 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
             for (auto& inst : bb->getInstList()) {
                 const auto get_rng = [&bb, get_range_by_bb](auto var) { return get_range_by_bb(var, bb); };
-                // TODO: handle void types:
                 // Store / Call / Return
+                if (const auto call = dyn_cast<CallInst>(&inst)) {
+                    if (const auto f = call->getCalledFunction()) {
+                        if (!f->getType()->isIntegerTy()) // return value is integer.
+                            continue;
+                        // low precision: just apply!
+                        cur_rng[call] = m_func2ret_range[f];
+                    }
+                } else if (const auto store = dyn_cast<StoreInst>(&inst)) {
+                    // is global var
+                    const auto val = store->getValueOperand();
+                    const auto ptr = store->getPointerOperand();
+
+                    auto valrng = get_rng(val);
+                    if (const auto gv = dyn_cast<GlobalVariable>(ptr)) {
+                        // should be lazy mode. check local vars first and then check global vars.
+                        m_global2range[gv] = m_global2range[gv].unionWith(valrng);
+                    }
+                    // is local var
+                    cur_rng[ptr] = valrng; // better precision.
+                    continue;
+                } else if (const auto ret = dyn_cast<ReturnInst>(&inst)) {
+                    // low precision: just apply!
+                    if (F.getReturnType()->isIntegerTy()) {
+                        m_func2ret_range[&F] = m_func2ret_range[&F].unionWith(get_rng(ret->getReturnValue()));
+                        MKINT_LOG() << "Func: " << F.getName() << " -> " << m_func2ret_range[&F];
+                    }
+                }
 
                 // return type should be int
                 if (!inst.getType()->isIntegerTy()) {
@@ -498,7 +539,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                     }();
                 }
 
-                bb_range[bb][&inst] = bb_range[bb][&inst].unionWith(new_range);
+                cur_rng[&inst] = cur_rng[&inst].unionWith(new_range);
             }
         }
 
@@ -522,14 +563,11 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             }
         }
 
+        this->init_ranges(M);
         while (true) { // iterative range analysis.
             bool changed = false;
-            for (auto& F : M) {
-                if (F.isDeclaration()) {
-                    MKINT_LOG() << "Skip range analysis for declaration func: " << F.getName();
-                    continue;
-                }
-                changed |= range_analysis(F);
+            for (auto& F : m_range_analysis_funcs) {
+                changed |= range_analysis(*F);
             }
             if (!changed)
                 break;
@@ -543,10 +581,48 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         return PreservedAnalyses::all();
     }
 
+    void init_ranges(Module& M)
+    {
+        for (auto& F : M) {
+            if (F.getReturnType()->isIntegerTy() || is_taint_src(F.getName())) {
+                if (F.isDeclaration()) {
+                    m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), true); // full.
+                    MKINT_LOG() << "Skip range analysis for func w/o impl: " << F.getName();
+                } else {
+                    if (F.getReturnType()->isIntegerTy())
+                        m_func2ret_range[&F] = crange::getEmpty(F.getReturnType()->getIntegerBitWidth());
+                    m_range_analysis_funcs.insert(&F);
+                }
+            } else {
+                MKINT_LOG() << "Skip range analysis for non-integer func: " << F.getName();
+            }
+        }
+
+        // global variables
+        for (const auto& GV : M.globals()) {
+            MKINT_LOG() << "Found global var " << GV.getName() << " of type " << *GV.getType();
+            // TODO: handle struct (ptr); array (ptr)
+            if (GV.getType()->isIntOrPtrTy()) {
+                if (GV.hasInitializer()) {
+                    auto init_val = dyn_cast<ConstantInt>(GV.getInitializer())->getValue();
+                    MKINT_LOG() << GV.getName() << " init by " << init_val;
+                    m_global2range[&GV] = crange();
+                } else {
+                    m_global2range[&GV] = crange(GV.getType()->getIntegerBitWidth()); // can be all range.
+                }
+            }
+        }
+    }
+
 private:
     MapVector<StringRef, std::vector<Instruction*>> m_func2tsrc;
-    DenseMap<const Function*, bbrange_t> m_func2range_info;
     DenseMap<const BasicBlock*, SetVector<const BasicBlock*>> m_backedges;
+
+    // for range analysis
+    std::map<const Function*, bbrange_t> m_func2range_info;
+    std::map<const Function*, crange> m_func2ret_range;
+    SetVector<const Function*> m_range_analysis_funcs;
+    std::map<const GlobalValue*, crange> m_global2range;
 };
 } // namespace
 
