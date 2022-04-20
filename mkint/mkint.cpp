@@ -1,8 +1,10 @@
 #include "log.hpp"
 #include "smt.hpp"
+#include "rang.hpp"
 
 #include <cxxabi.h>
 
+#include <llvm-14/llvm/IR/Constants.h>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/SetVector.h>
@@ -366,28 +368,30 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                                 continue;
                             }
 
-                            auto trng = get_range_by_bb(lhs, pred), frng = get_range_by_bb(rhs, pred);
+                            auto lrng = get_range_by_bb(lhs, pred), rrng = get_range_by_bb(rhs, pred);
+
+                            MKINT_LOG() << "br: " << *cmp << " -> (" << lrng << ", " << rrng << ')';
 
                             if (cur_rng.count(lhs) == 0)
-                                cur_rng[lhs] = crange::getEmpty(lhs->getType()->getIntegerBitWidth());
+                                cur_rng[lhs] = crange(lhs->getType()->getIntegerBitWidth(), false);
 
                             if (cur_rng.count(rhs) == 0)
-                                cur_rng[rhs] = crange::getEmpty(rhs->getType()->getIntegerBitWidth());
+                                cur_rng[rhs] = crange(rhs->getType()->getIntegerBitWidth(), false);
 
-                            if (cmp->getOperand(0) == bb) { // T branch
-                                crange lprng = crange::makeAllowedICmpRegion(cmp->getSwappedPredicate(), trng);
-                                crange rprng = crange::makeAllowedICmpRegion(cmp->getPredicate(), frng);
+                            if (br->getSuccessor(0) == bb) { // T branch
+                                crange lprng = crange::makeAllowedICmpRegion(cmp->getSwappedPredicate(), lrng);
+                                crange rprng = crange::makeAllowedICmpRegion(cmp->getPredicate(), rrng);
 
-                                cur_rng[lhs] = cur_rng[lhs].intersectWith(lprng); // ! intersect
-                                cur_rng[rhs] = cur_rng[rhs].intersectWith(rprng);
+                                cur_rng[lhs] = cur_rng[lhs].unionWith(lrng.intersectWith(lprng));
+                                cur_rng[rhs] = cur_rng[rhs].unionWith(rrng.intersectWith(rprng));
                             } else { // F branch
                                 crange lprng = crange::makeAllowedICmpRegion(
-                                    CmpInst::getInversePredicate(cmp->getSwappedPredicate()), trng);
+                                    CmpInst::getInversePredicate(cmp->getSwappedPredicate()), lrng);
                                 crange rprng = crange::makeAllowedICmpRegion(
-                                    CmpInst::getInversePredicate(cmp->getPredicate()), frng);
+                                    CmpInst::getInversePredicate(cmp->getPredicate()), rrng);
 
-                                cur_rng[lhs] = cur_rng[lhs].unionWith(bb_range[pred][lhs].intersectWith(lprng));
-                                cur_rng[rhs] = cur_rng[rhs].unionWith(bb_range[pred][rhs].intersectWith(rprng));
+                                cur_rng[lhs] = cur_rng[lhs].unionWith(lrng.intersectWith(lprng));
+                                cur_rng[rhs] = cur_rng[rhs].unionWith(rrng.intersectWith(rprng));
                             }
 
                             narrowed_insts.insert(lhs);
@@ -571,6 +575,8 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 break;
             }
         }
+        this->pring_all_ranges();
+
 
         return PreservedAnalyses::all();
     }
@@ -617,6 +623,35 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                     m_global2range[&GV] = crange();
                 } else {
                     m_global2range[&GV] = crange(GV.getType()->getIntegerBitWidth()); // can be all range.
+                }
+            }
+        }
+    }
+
+    void pring_all_ranges() const {
+        MKINT_LOG() << "========== Function Return Ranges ==========";
+        for (const auto& [F, rng] : m_func2ret_range) {
+            MKINT_LOG() << rang::bg::black << rang::fg::green << F->getName() << rang::style::reset << " -> " << rng;
+        }
+
+        MKINT_LOG() << "========== Global Variable Ranges ==========";
+        for (const auto& [GV, rng] : m_global2range) {
+            MKINT_LOG() << rang::bg::black << rang::fg::blue << GV->getName() << rang::style::reset << " -> " << rng;
+        }
+
+        MKINT_LOG() << "============ Function Inst Ranges ===========";
+        for (const auto& [F, blk2rng] : m_func2range_info) {
+            MKINT_LOG() << " ----------- Function Name : " << rang::bg::black << rang::fg::green << F->getName() << rang::style::reset;
+            for (const auto& [blk, inst2rng] : blk2rng) {
+                MKINT_LOG() << " ----------- Basic Block ----------- ";
+                for (const auto& [val, rng] : inst2rng) {
+                    if (dyn_cast<ConstantInt>(val))
+                        continue; // meaningless to pring const range.
+
+                    if (rng.isFullSet())
+                        MKINT_LOG() << *val << "\t -> " << rng;
+                    else
+                        MKINT_LOG() << *val << "\t -> " << rang::bg::black << rang::fg::yellow << rng << rang::style::reset;
                 }
             }
         }
