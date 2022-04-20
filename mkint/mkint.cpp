@@ -318,7 +318,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }
     }
 
-    bool range_analysis(const Function& F)
+    void range_analysis(const Function& F)
     {
         MKINT_LOG() << "Range Analysis -> " << F.getName();
         // TODO: consider global symbols.
@@ -326,18 +326,6 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         worklist.push_back(&(F.getEntryBlock()));
 
         auto& bb_range = m_func2range_info[&F];
-        const auto old_rng = bb_range;
-
-        for (const auto& arg : F.args()) {
-            if (arg.getType()->isIntegerTy() && bb_range[&(F.getEntryBlock())].count(&arg) == 0) {
-                // be conservative first.
-                if (is_taint_src(F.getName())) { // for taint source, we assume full set.
-                    bb_range[&(F.getEntryBlock())][&arg] = crange(arg.getType()->getIntegerBitWidth(), true);
-                } else {
-                    bb_range[&(F.getEntryBlock())][&arg] = crange(arg.getType()->getIntegerBitWidth(), false);
-                }
-            }
-        }
 
         while (!worklist.empty()) {
             auto bb = worklist.back();
@@ -472,6 +460,12 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 // Store / Call / Return
                 if (const auto call = dyn_cast<CallInst>(&inst)) {
                     if (const auto f = call->getCalledFunction()) {
+                        for (const auto& arg : f->args()) {
+                            auto& argblock = m_func2range_info[f][&(f->getEntryBlock())];
+                            if (arg.getType()->isIntegerTy())
+                                argblock[&arg] = argblock[&arg].unionWith(get_rng(call->getArgOperand(arg.getArgNo())));
+                        }
+
                         if (!f->getType()->isIntegerTy()) // return value is integer.
                             continue;
                         // low precision: just apply!
@@ -542,8 +536,6 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 cur_rng[&inst] = cur_rng[&inst].unionWith(new_range);
             }
         }
-
-        return old_rng != bb_range; // changed
     }
 
     PreservedAnalyses run(Module& M, ModuleAnalysisManager& MAM)
@@ -565,11 +557,15 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
         this->init_ranges(M);
         while (true) { // iterative range analysis.
-            bool changed = false;
+            const auto old_fn_rng = m_func2range_info;
+            const auto old_glb_rng = m_global2range;
+            const auto old_fn_ret_rng = m_func2ret_range;
+
             for (auto& F : m_range_analysis_funcs) {
-                changed |= range_analysis(*F);
+                range_analysis(*F);
             }
-            if (!changed)
+
+            if (m_func2range_info != old_fn_rng || old_glb_rng != m_global2range || old_fn_ret_rng != m_func2ret_range)
                 break;
             if (++try_count > max_try) {
                 MKINT_LOG() << "[Iterative Range Analysis] "
@@ -591,6 +587,20 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 } else {
                     if (F.getReturnType()->isIntegerTy())
                         m_func2ret_range[&F] = crange::getEmpty(F.getReturnType()->getIntegerBitWidth());
+
+                    // init the arg range
+                    auto& init_blk = m_func2range_info[&F][&(F.getEntryBlock())];
+                    for (const auto& arg : F.args()) {
+                        if (arg.getType()->isIntegerTy()) {
+                            // be conservative first.
+                            // TODO: fine-grained arg range (some taint, some not)
+                            if (is_taint_src(F.getName())) { // for taint source, we assume full set.
+                                init_blk[&arg] = crange(arg.getType()->getIntegerBitWidth(), true);
+                            } else {
+                                init_blk[&arg] = crange(arg.getType()->getIntegerBitWidth(), false);
+                            }
+                        }
+                    }
                     m_range_analysis_funcs.insert(&F);
                 }
             } else {
