@@ -1,6 +1,6 @@
 #include "log.hpp"
-#include "smt.hpp"
 #include "rang.hpp"
+#include "smt.hpp"
 
 #include <cxxabi.h>
 
@@ -31,7 +31,6 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
-#include <iostream>
 #include <limits>
 #include <map>
 #include <optional>
@@ -370,8 +369,6 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
                             auto lrng = get_range_by_bb(lhs, pred), rrng = get_range_by_bb(rhs, pred);
 
-                            MKINT_LOG() << "br: " << *cmp << " -> (" << lrng << ", " << rrng << ')';
-
                             if (cur_rng.count(lhs) == 0)
                                 cur_rng[lhs] = crange(lhs->getType()->getIntegerBitWidth(), false);
 
@@ -379,19 +376,29 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                                 cur_rng[rhs] = crange(rhs->getType()->getIntegerBitWidth(), false);
 
                             if (br->getSuccessor(0) == bb) { // T branch
-                                crange lprng = crange::makeAllowedICmpRegion(cmp->getSwappedPredicate(), lrng);
-                                crange rprng = crange::makeAllowedICmpRegion(cmp->getPredicate(), rrng);
+                                // makeAllowedICmpRegion: many false positives.
+                                // makeSatisfyingICmpRegion: might miss some true positives.
+                                crange lprng = crange::makeAllowedICmpRegion(cmp->getPredicate(), rrng);
+                                crange rprng = crange::makeAllowedICmpRegion(cmp->getSwappedPredicate(), lrng);
 
-                                cur_rng[lhs] = cur_rng[lhs].unionWith(lrng.intersectWith(lprng));
-                                cur_rng[rhs] = cur_rng[rhs].unionWith(rrng.intersectWith(rprng));
+                                // Don't change constant's value.
+                                cur_rng[lhs] = dyn_cast<ConstantInt>(lhs)
+                                    ? lrng
+                                    : lrng.intersectWith(lprng).unionWith(cur_rng[lhs]);
+                                cur_rng[rhs] = dyn_cast<ConstantInt>(rhs)
+                                    ? rrng
+                                    : rrng.intersectWith(rprng).unionWith(cur_rng[rhs]);
                             } else { // F branch
-                                crange lprng = crange::makeAllowedICmpRegion(
-                                    CmpInst::getInversePredicate(cmp->getSwappedPredicate()), lrng);
+                                crange lprng = crange::makeAllowedICmpRegion(cmp->getInversePredicate(), rrng);
                                 crange rprng = crange::makeAllowedICmpRegion(
-                                    CmpInst::getInversePredicate(cmp->getPredicate()), rrng);
-
-                                cur_rng[lhs] = cur_rng[lhs].unionWith(lrng.intersectWith(lprng));
-                                cur_rng[rhs] = cur_rng[rhs].unionWith(rrng.intersectWith(rprng));
+                                    CmpInst::getInversePredicate(cmp->getPredicate()), lrng);
+                                // Don't change constant's value.
+                                cur_rng[lhs] = dyn_cast<ConstantInt>(lhs)
+                                    ? lrng
+                                    : lrng.intersectWith(lprng).unionWith(cur_rng[lhs]);
+                                cur_rng[rhs] = dyn_cast<ConstantInt>(rhs)
+                                    ? rrng
+                                    : rrng.intersectWith(rprng).unionWith(cur_rng[rhs]);
                             }
 
                             narrowed_insts.insert(lhs);
@@ -463,14 +470,14 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                         for (const auto& arg : f->args()) {
                             auto& argblock = m_func2range_info[f][&(f->getEntryBlock())];
                             if (arg.getType()->isIntegerTy())
-                                argblock[&arg] = argblock[&arg].unionWith(get_rng(call->getArgOperand(arg.getArgNo())));
+                                argblock[&arg] = get_rng(call->getArgOperand(arg.getArgNo())).unionWith(argblock[&arg]);
                         }
 
-                        if (!f->getReturnType()->isIntegerTy()) // return value is integer.
-                            continue;
-                        // low precision: just apply!
-                        cur_rng[call] = m_func2ret_range[f];
+                        if (f->getReturnType()->isIntegerTy()) // return value is integer.
+                            cur_rng[call] = m_func2ret_range[f];
                     }
+
+                    continue;
                 } else if (const auto store = dyn_cast<StoreInst>(&inst)) {
                     // is global var
                     const auto val = store->getValueOperand();
@@ -486,10 +493,9 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                     continue;
                 } else if (const auto ret = dyn_cast<ReturnInst>(&inst)) {
                     // low precision: just apply!
-                    if (F.getReturnType()->isIntegerTy()) {
+                    if (F.getReturnType()->isIntegerTy())
                         m_func2ret_range[&F] = get_rng(ret->getReturnValue()).unionWith(m_func2ret_range[&F]);
-                        MKINT_LOG() << "Range of fn " << F.getName() << " -> " << m_func2ret_range[&F];
-                    }
+
                     continue;
                 }
 
@@ -498,7 +504,8 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                     continue;
                 }
 
-                crange new_range;
+                // empty range
+                crange new_range = crange::getEmpty(inst.getType()->getIntegerBitWidth());
 
                 if (const BinaryOperator* op = dyn_cast<BinaryOperator>(&inst)) {
                     auto lhs = op->getOperand(0);
@@ -532,10 +539,19 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
                         return inprng;
                     }();
+                } else if (const PHINode* op = dyn_cast<PHINode>(&inst)) {
+                    for (size_t i = 0; i < op->getNumIncomingValues(); ++i) {
+                        auto pred = op->getIncomingBlock(i);
+                        if (m_backedges[bb].contains(pred)) {
+                            continue; // skip backedge
+                        }
+                        new_range = new_range.unionWith(get_range_by_bb(op->getIncomingValue(i), pred));
+                    }
+                } else {
+                    MKINT_CHECK_RELAX(false) << " [Range Analysis] Unhandled instruction: " << inst;
                 }
 
                 cur_rng[&inst] = cur_rng[&inst].unionWith(new_range);
-                MKINT_LOG() << "Range of " << inst << " -> " << cur_rng[&inst];
             }
         }
     }
@@ -567,7 +583,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 range_analysis(*F);
             }
 
-            if (m_func2range_info != old_fn_rng || old_glb_rng != m_global2range || old_fn_ret_rng != m_func2ret_range)
+            if (m_func2range_info == old_fn_rng && old_glb_rng == m_global2range && old_fn_ret_rng == m_func2ret_range)
                 break;
             if (++try_count > max_try) {
                 MKINT_LOG() << "[Iterative Range Analysis] "
@@ -576,7 +592,6 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             }
         }
         this->pring_all_ranges();
-
 
         return PreservedAnalyses::all();
     }
@@ -628,7 +643,8 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }
     }
 
-    void pring_all_ranges() const {
+    void pring_all_ranges() const
+    {
         MKINT_LOG() << "========== Function Return Ranges ==========";
         for (const auto& [F, rng] : m_func2ret_range) {
             MKINT_LOG() << rang::bg::black << rang::fg::green << F->getName() << rang::style::reset << " -> " << rng;
@@ -641,7 +657,8 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
         MKINT_LOG() << "============ Function Inst Ranges ===========";
         for (const auto& [F, blk2rng] : m_func2range_info) {
-            MKINT_LOG() << " ----------- Function Name : " << rang::bg::black << rang::fg::green << F->getName() << rang::style::reset;
+            MKINT_LOG() << " ----------- Function Name : " << rang::bg::black << rang::fg::green << F->getName()
+                        << rang::style::reset;
             for (const auto& [blk, inst2rng] : blk2rng) {
                 MKINT_LOG() << " ----------- Basic Block ----------- ";
                 for (const auto& [val, rng] : inst2rng) {
@@ -651,7 +668,8 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                     if (rng.isFullSet())
                         MKINT_LOG() << *val << "\t -> " << rng;
                     else
-                        MKINT_LOG() << *val << "\t -> " << rang::bg::black << rang::fg::yellow << rng << rang::style::reset;
+                        MKINT_LOG() << *val << "\t -> " << rang::bg::black << rang::fg::yellow << rng
+                                    << rang::style::reset;
                 }
             }
         }
