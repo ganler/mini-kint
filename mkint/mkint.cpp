@@ -414,12 +414,26 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                     }
 
                     auto cond_rng = get_range_by_bb(cond, bb);
+                    auto emp_rng = crange::getEmpty(cond->getType()->getIntegerBitWidth());
 
                     if (swt->getDefaultDest() == bb) { // default
-
+                        // not (all)
+                        for (auto c : swt->cases()) {
+                            auto case_val = c.getCaseValue();
+                            emp_rng = emp_rng.unionWith(case_val->getValue());
+                        }
+                        emp_rng = emp_rng.inverse();
                     } else {
+                        for (auto c : swt->cases()) {
+                            if (c.getCaseSuccessor() == bb) {
+                                auto case_val = c.getCaseValue();
+                                emp_rng = emp_rng.unionWith(case_val->getValue());
+                            }
+                        }
                     }
 
+                    cur_rng[cond] = cond_rng.unionWith(emp_rng);
+                    narrowed_insts.insert(cond);
                 } else {
                     // try catch... (thank god, C does not have try-catch)
                     // indirectbr... ?
