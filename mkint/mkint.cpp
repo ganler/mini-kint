@@ -80,6 +80,14 @@ struct crange : public ConstantRange {
         : ConstantRange(0, true)
     {
     }
+
+    static constexpr auto cmpRegion()
+    {
+        // makeAllowedICmpRegion: many false positives.
+        return ConstantRange::makeAllowedICmpRegion;
+        // makeSatisfyingICmpRegion: might miss some true positives.
+        // return ConstantRange::makeSatisfyingICmpRegion;
+    }
 };
 
 namespace {
@@ -173,15 +181,35 @@ static bool is_sink_reachable(Instruction* inst)
     }
 
     bool you_see_sink /* ? */ = false;
-    for (auto user : inst->users()) {
-        if (auto user_inst = dyn_cast<Instruction>(user)) {
-            you_see_sink |= is_sink_reachable(user_inst);
-        }
-    }
 
-    if (you_see_sink) {
-        mark_taint(*inst);
-        return true;
+    // if store
+    if (auto store = dyn_cast<StoreInst>(inst)) {
+        auto ptr = store->getPointerOperand();
+        if (auto gv = dyn_cast<GlobalVariable>(ptr)) {
+            for (const auto& user : gv->users()) {
+                if (auto user_inst = dyn_cast<Instruction>(user)) {
+                    if (user != store) // no self-loop.
+                        you_see_sink |= is_sink_reachable(user_inst);
+                }
+            }
+
+            if (you_see_sink) {
+                mark_taint(*inst);
+                gv->setMetadata(MKINT_IR_TAINT, inst->getMetadata(MKINT_IR_TAINT));
+                return true;
+            }
+        }
+    } else {
+        for (auto user : inst->users()) {
+            if (auto user_inst = dyn_cast<Instruction>(user)) {
+                you_see_sink |= is_sink_reachable(user_inst);
+            }
+        }
+
+        if (you_see_sink) {
+            mark_taint(*inst);
+            return true;
+        }
     }
 
     return false;
@@ -329,7 +357,6 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             auto& cur_rng = bb_range[bb];
 
             const auto get_range_by_bb = [this, &bb_range](auto var, const BasicBlock* bb) -> crange {
-                // FIXME: check global var.
                 if (auto lconst = dyn_cast<ConstantInt>(var)) {
                     return crange(lconst->getValue());
                 } else {
@@ -376,10 +403,8 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                                 cur_rng[rhs] = crange(rhs->getType()->getIntegerBitWidth(), false);
 
                             if (br->getSuccessor(0) == bb) { // T branch
-                                // makeAllowedICmpRegion: many false positives.
-                                // makeSatisfyingICmpRegion: might miss some true positives.
-                                crange lprng = crange::makeAllowedICmpRegion(cmp->getPredicate(), rrng);
-                                crange rprng = crange::makeAllowedICmpRegion(cmp->getSwappedPredicate(), lrng);
+                                crange lprng = crange::cmpRegion()(cmp->getPredicate(), rrng);
+                                crange rprng = crange::cmpRegion()(cmp->getSwappedPredicate(), lrng);
 
                                 // Don't change constant's value.
                                 cur_rng[lhs] = dyn_cast<ConstantInt>(lhs)
@@ -389,9 +414,9 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                                     ? rrng
                                     : rrng.intersectWith(rprng).unionWith(cur_rng[rhs]);
                             } else { // F branch
-                                crange lprng = crange::makeAllowedICmpRegion(cmp->getInversePredicate(), rrng);
-                                crange rprng = crange::makeAllowedICmpRegion(
-                                    CmpInst::getInversePredicate(cmp->getPredicate()), lrng);
+                                crange lprng = crange::cmpRegion()(cmp->getInversePredicate(), rrng);
+                                crange rprng
+                                    = crange::cmpRegion()(CmpInst::getInversePredicate(cmp->getPredicate()), lrng);
                                 // Don't change constant's value.
                                 cur_rng[lhs] = dyn_cast<ConstantInt>(lhs)
                                     ? lrng
