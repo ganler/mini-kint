@@ -3,6 +3,7 @@
 
 #include <cxxabi.h>
 
+#include <llvm-14/llvm/IR/Value.h>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/SetVector.h>
@@ -329,6 +330,17 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
             auto& cur_rng = bb_range[bb];
 
+            const auto get_range_by_bb = [&bb_range](auto var, const BasicBlock* bb) {
+                if (auto lconst = dyn_cast<ConstantInt>(var)) {
+                    return crange(lconst->getValue());
+                } else {
+                    if (bb_range[bb].count(var) == 0) {
+                        MKINT_CHECK_ABORT(false) << "Unknown operand type: " << *var;
+                    }
+                    return bb_range[bb][var];
+                }
+            };
+
             // merge all incoming bbs
             for (const auto& pred : predecessors(bb)) {
                 // avoid backedge: pred can't be a successor of bb.
@@ -336,30 +348,98 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                     continue; // skip backedge
                 }
 
-                for (const auto& inst : pred->getInstList()) {
-                    if (auto it = cur_rng.find(&inst); it == cur_rng.end()) { // not found
-                        cur_rng[&inst] = bb_range[pred][&inst];
-                    } else { // merge
-                        it->second = it->second.unionWith(bb_range[pred][&inst]);
+                SetVector<const Value*> narrowed_insts;
+
+                // TODO: check pred branch for conditions.
+                // branch or switch
+                // NOTE: branch should be used to narrow the range.
+                if (auto terminator = pred->getTerminator(); auto br = dyn_cast<BranchInst>(terminator)) {
+                    if (br->isConditional()) {
+                        if (auto cmp = dyn_cast<ICmpInst>(br->getCondition())) {
+                            // br: a op b == true or false
+                            // makeAllowedICmpRegion turning a op b into a range.
+                            auto lhs = cmp->getOperand(0);
+                            auto rhs = cmp->getOperand(1);
+
+                            if (!lhs->getType()->isIntegerTy() || !rhs->getType()->isIntegerTy()) {
+                                // This should be covered by `ICmpInst`.
+                                MKINT_CHECK_ABORT(false) << "The br operands are not both integers: " << *cmp;
+                                continue;
+                            }
+
+                            auto trng = get_range_by_bb(lhs, bb), frng = get_range_by_bb(rhs, bb);
+
+                            if (cur_rng.count(lhs) == 0)
+                                cur_rng[lhs] = crange::getEmpty(lhs->getType()->getIntegerBitWidth());
+
+                            if (cur_rng.count(rhs) == 0)
+                                cur_rng[rhs] = crange::getEmpty(rhs->getType()->getIntegerBitWidth());
+
+                            if (cmp->getOperand(0) == bb) { // T branch
+                                crange lprng = crange::makeAllowedICmpRegion(cmp->getSwappedPredicate(), trng);
+                                crange rprng = crange::makeAllowedICmpRegion(cmp->getPredicate(), frng);
+
+                                cur_rng[lhs] = cur_rng[lhs].intersectWith(lprng); // ! intersect
+                                cur_rng[rhs] = cur_rng[rhs].intersectWith(rprng);
+                            } else { // F branch
+                                crange lprng = crange::makeAllowedICmpRegion(
+                                    CmpInst::getInversePredicate(cmp->getSwappedPredicate()), trng);
+                                crange rprng = crange::makeAllowedICmpRegion(
+                                    CmpInst::getInversePredicate(cmp->getPredicate()), frng);
+
+                                cur_rng[lhs] = cur_rng[lhs].unionWith(bb_range[pred][lhs].intersectWith(lprng));
+                                cur_rng[rhs] = cur_rng[rhs].unionWith(bb_range[pred][rhs].intersectWith(rprng));
+                            }
+
+                            narrowed_insts.insert(lhs);
+                            narrowed_insts.insert(rhs);
+                        }
+                    }
+                } else if (auto swt = dyn_cast<SwitchInst>(terminator)) {
+                    // switch
+                    // ; Emulate a conditional br instruction
+                    // %Val = zext i1 %value to i32
+                    // switch i32 %Val, label %truedest [ i32 0, label %falsedest ]
+
+                    // ; Emulate an unconditional br instruction
+                    // switch i32 0, label %dest [ ]
+
+                    // ; Implement a jump table:
+                    // switch i32 %val, label %otherwise [ i32 0, label %onzero
+                    //                                     i32 1, label %onone
+                    //                                     i32 2, label %ontwo ]
+                    auto cond = swt->getCondition();
+                    if (!cond->getType()->isIntegerTy()) {
+                        continue;
+                    }
+
+                    auto cond_rng = get_range_by_bb(cond, bb);
+
+                    if (swt->getDefaultDest() == bb) { // default
+
+                    } else {
+                    }
+
+                } else {
+                    // try catch... (thank god, C does not have try-catch)
+                    // indirectbr... ?
+                    MKINT_CHECK_ABORT(false) << "Unknown terminator: " << *pred->getTerminator();
+                }
+
+                for (const auto& [inst, rng] : bb_range[pred]) {
+                    // TODO: Optimization: No need to track all values.
+                    if (!narrowed_insts.contains(inst)) { // for branched insts, the ranges is computed.
+                        if (auto it = cur_rng.find(inst); it == cur_rng.end()) { // not found
+                            cur_rng[inst] = rng;
+                        } else { // merge
+                            it->second = it->second.unionWith(rng);
+                        }
                     }
                 }
             }
 
-            // TODO: check pred branch for conditions.
-
             for (auto& inst : bb->getInstList()) {
-                const auto get_rng = [&bb_range, &bb, &inst](auto var) -> crange {
-                    if (auto lconst = dyn_cast<ConstantInt>(var)) {
-                        return crange(lconst->getValue());
-                    } else {
-                        if (bb_range[bb].count(var) == 0) {
-                            std::string str;
-                            llvm::raw_string_ostream(str) << *var << " in " << inst;
-                            MKINT_CHECK_ABORT(false) << "Unknown operand type: " << str;
-                        }
-                        return bb_range[bb][var];
-                    }
-                };
+                const auto get_rng = [&bb, get_range_by_bb](auto var) { return get_range_by_bb(var, bb); };
                 // TODO: handle void types:
                 // Store / Call / Return
 
