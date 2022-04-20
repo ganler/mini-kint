@@ -41,7 +41,6 @@
 using namespace llvm;
 
 // TODO: consider constraints from annotation;
-// TODO: consider sink annotation;
 
 constexpr const char* MKINT_IR_TAINT = "mkint.taint";
 constexpr const char* MKINT_IR_SINK = "mkint.sink";
