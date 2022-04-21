@@ -574,6 +574,9 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                     }
                 } else if (const auto op = dyn_cast<LoadInst>(&inst)) {
                     new_range = get_rng(op->getPointerOperand());
+                } else if (const auto op = dyn_cast<CmpInst>(&inst)) {
+                    // can be more precise by comparing the range...
+                    // but nah...
                 } else {
                     MKINT_CHECK_RELAX(false) << " [Range Analysis] Unhandled instruction: " << inst;
                 }
