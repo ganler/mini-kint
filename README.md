@@ -55,3 +55,8 @@ Is this bug related to **untrusted input**.
 
 - **Taint sources**: arguments of functions whose names start with `sys_` or `__mkint_ann_`.
 - **Sinks**: `kmalloc:0`, `kzalloc:0`, `vmalloc:0`, etc.
+
+## Known Issues
+
+**(M1-LLVM-13-Homebrew)** For LLVM-13 installed from Homebrew M1 Monterey stable, the program will crash on `ConstantRange::extendSigned` but it is fine on Linux machines.
+This looks like a LLVM bug.
