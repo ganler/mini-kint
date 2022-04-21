@@ -71,12 +71,14 @@ namespace detail {
 
 detail::log_wrapper log();
 detail::log_wrapper debug();
+detail::log_wrapper warn();
 detail::log_wrapper check(bool cond, bool abort, std::string_view prompt, std::string_view file, size_t line);
 
 } // namespace mkint
 
 #define MKINT_LOG() mkint::log()
 #define MKINT_DEBUG() mkint::debug()
+#define MKINT_WARN() mkint::warn()
 
 #define MKINT_CHECK_1(cond) mkint::check(cond, true, #cond, __FILE__, __LINE__)
 #define MKINT_CHECK_2(cond, abort) mkint::check(cond, abort, #cond, __FILE__, __LINE__)

@@ -9,6 +9,7 @@
 #include <llvm/ADT/SetVector.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/StringRef.h>
+#include <llvm/IR/Argument.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/ConstantRange.h>
 #include <llvm/IR/Constants.h>
@@ -60,8 +61,8 @@ template <typename V, typename... Vs> static constexpr std::array<V, sizeof...(V
     return std::array<V, sizeof...(Vs)> { vs... };
 }
 
-constexpr auto MKINT_SINKS = mkarray<std::pair<const char*, size_t>>(
-    std::pair { "kmalloc", 0 }, std::pair { "kzalloc", 0 }, std::pair { "vmalloc", 0 });
+constexpr auto MKINT_SINKS = mkarray<std::pair<const char*, size_t>>(std::pair { "malloc", 0 },
+    std::pair { "xmalloc", 0 }, std::pair { "kmalloc", 0 }, std::pair { "kzalloc", 0 }, std::pair { "vmalloc", 0 });
 
 struct crange : public ConstantRange {
     /// https://llvm.org/doxygen/classllvm_1_1ConstantRange.html
@@ -171,69 +172,6 @@ static std::vector<Instruction*> get_taint_source(Function& F)
 
 static bool is_taint_src_arg_call(StringRef s) { return s.contains(".mkint.arg"); }
 
-static bool is_sink_reachable(Instruction* inst)
-{
-    // we want to only mark sink-reachable taints; and
-    // find out if the return value is tainted.
-    if (nullptr == inst) {
-        return false;
-    } else if (inst->getMetadata(MKINT_IR_SINK)) {
-        return true;
-    }
-
-    bool you_see_sink /* ? */ = false;
-
-    // if store
-    if (auto store = dyn_cast<StoreInst>(inst)) {
-        auto ptr = store->getPointerOperand();
-        if (auto gv = dyn_cast<GlobalVariable>(ptr)) {
-            for (const auto& user : gv->users()) {
-                if (auto user_inst = dyn_cast<Instruction>(user)) {
-                    if (user != store) // no self-loop.
-                        you_see_sink |= is_sink_reachable(user_inst);
-                }
-            }
-
-            if (you_see_sink) {
-                mark_taint(*inst);
-                gv->setMetadata(MKINT_IR_TAINT, inst->getMetadata(MKINT_IR_TAINT));
-                return true;
-            }
-        }
-    } else {
-        for (auto user : inst->users()) {
-            if (auto user_inst = dyn_cast<Instruction>(user)) {
-                you_see_sink |= is_sink_reachable(user_inst);
-            }
-        }
-
-        if (you_see_sink) {
-            mark_taint(*inst);
-            return true;
-        }
-    }
-
-    return false;
-}
-
-static void taint_broadcasting(const std::vector<Instruction*>& taint_source)
-{
-    // ? Note we currently assume that sub-func-calls do not have sinks...
-    // ? otherwise we need a use-def tree to do the job (but too complicated).
-    // Propogation: This pass should only consider single-function-level tainting.
-    //              In `out = call(..., taint, ...)`, `out` is tainted. But let's
-    //              refine that in cross-function-level tainting.
-
-    // Algo: should do depth-first search until we find a sink. If we find a sink,
-    //       we backtrack and mark taints.
-
-    for (auto ts : taint_source) {
-        if (is_sink_reachable(ts)) {
-            mark_taint(*ts, "source");
-        }
-    }
-}
-
 static void mark_func_sinks(Function& F)
 {
     static auto mark_sink = [](Instruction& inst, std::string_view sink_name) {
@@ -247,11 +185,15 @@ static void mark_func_sinks(Function& F)
             // call in MKINT_SINKS
             for (const auto& [name, idx] : MKINT_SINKS) {
                 const auto demangled_func_name = demangle(call->getCalledFunction()->getName().str().c_str());
-                if (StringRef(demangled_func_name).startswith(name)) {
+                if (demangled_func_name == name) {
                     if (auto inst = dyn_cast_or_null<Instruction>(call->getArgOperand(idx))) {
+                        MKINT_LOG() << "Marking sink: " << demangled_func_name;
                         mark_sink(*inst, name);
                     }
                     break;
+                } else if (StringRef(demangled_func_name).startswith(name)) {
+                    MKINT_WARN() << "Are you missing the sink? [demangled_func_name]: " << demangled_func_name
+                                 << "; [name]: " << name;
                 }
             }
         }
@@ -308,22 +250,6 @@ crange compute_binary_rng(const BinaryOperator* op, crange lhs_, crange rhs_)
 }
 
 struct MKintPass : public PassInfoMixin<MKintPass> {
-    void taint_analysis(Function& F)
-    {
-        MKINT_LOG() << "Taint Analysis -> " << F.getName();
-        // Mark (source) taint/sink;
-        // * Note we must do this first b.c. this is a write pass.
-        // * the remaining stuff will at most add some metadata.
-        auto taint_sources = get_taint_source(F);
-        // for now, the taint_source are not marked as taint.
-        // because we only mark taints if sinks are reachable for a certain taint candidate.
-        mark_func_sinks(F);
-        taint_broadcasting(taint_sources);
-
-        if (!taint_sources.empty())
-            m_func2tsrc[F.getName()] = std::move(taint_sources);
-    }
-
     void backedge_analysis(const Function& F)
     {
         for (const auto& bb_ref : F) {
@@ -587,13 +513,141 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }
     }
 
+    bool is_sink_reachable(Instruction* inst)
+    {
+        // we want to only mark sink-reachable taints; and
+        // find out if the return value is tainted.
+        if (nullptr == inst) {
+            return false;
+        } else if (inst->getMetadata(MKINT_IR_SINK)) {
+            return true;
+        }
+
+        bool you_see_sink /* ? */ = false;
+
+        // if store
+        if (auto store = dyn_cast<StoreInst>(inst)) {
+            auto ptr = store->getPointerOperand();
+            if (auto gv = dyn_cast<GlobalVariable>(ptr)) {
+                for (const auto& user : gv->users()) {
+                    if (auto user_inst = dyn_cast<Instruction>(user)) {
+                        if (user != store) // no self-loop.
+                            you_see_sink |= is_sink_reachable(user_inst);
+                    }
+                }
+
+                if (you_see_sink) {
+                    mark_taint(*inst);
+                    gv->setMetadata(MKINT_IR_TAINT, inst->getMetadata(MKINT_IR_TAINT));
+                    return true;
+                }
+            }
+        } else {
+            if (auto call = dyn_cast<CallInst>(inst)) {
+                if (auto f = call->getCalledFunction()) {
+                    // How to do taint analysis for call func?
+                    // if func's impl is unknow we simply assume it is related.
+                    // if func's impl is known, we analyze which arg determines the return value.
+                    // if unrelated -> cut off the connection.
+                    // FIXME: But we simply assume it is related and people won't wrote stupid code that results are not
+                    // related to inputs.
+                    if (!f->isDeclaration() && taint_bcast_sink(f->args())) {
+                        you_see_sink = true;
+                        m_taint_funcs.insert(f);
+                    }
+                }
+            }
+
+            for (auto user : inst->users()) {
+                if (auto user_inst = dyn_cast<Instruction>(user)) {
+                    you_see_sink |= is_sink_reachable(user_inst);
+                }
+            }
+
+            if (you_see_sink) {
+                mark_taint(*inst);
+                if (auto call = dyn_cast<CallInst>(inst)) {
+                    if (auto f = call->getCalledFunction()) {
+                        if (!f->getReturnType()->isVoidTy()) {
+                            m_taint_funcs.insert(f);
+                        }
+                    }
+                }
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool taint_bcast_sink(const std::vector<Instruction*>& taint_source)
+    {
+        // ? Note we currently assume that sub-func-calls do not have sinks...
+        // ? otherwise we need a use-def tree to do the job (but too complicated).
+        // Propogation: This pass should only consider single-function-level tainting.
+        //              In `out = call(..., taint, ...)`, `out` is tainted. But let's
+        //              refine that in cross-function-level tainting.
+
+        // Algo: should do depth-first search until we find a sink. If we find a sink,
+        //       we backtrack and mark taints.
+
+        bool ret = false;
+
+        for (auto ts : taint_source) {
+            if (is_sink_reachable(ts)) {
+                mark_taint(*ts, "source");
+                ret = true;
+            }
+        }
+
+        return ret;
+    }
+
+    template <typename Iter> bool taint_bcast_sink(Iter taint_source)
+    {
+        bool ret = false;
+
+        for (auto& ts : taint_source) {
+            for (auto user : ts.users()) {
+                if (auto user_inst = dyn_cast<Instruction>(user)) {
+                    if (is_sink_reachable(user_inst)) {
+                        mark_taint(*user_inst);
+                        ret = true;
+                    }
+                }
+            }
+        }
+
+        return ret;
+    }
+
     PreservedAnalyses run(Module& M, ModuleAnalysisManager& MAM)
     {
         MKINT_LOG() << "Running MKint pass on module " << M.getName();
 
+        // Mark taint sources.
         for (auto& F : M) {
-            taint_analysis(F);
-        } // no writes anymore (except writing metadata).
+            auto taint_sources = get_taint_source(F);
+            mark_func_sinks(F);
+            if (!taint_sources.empty())
+                m_func2tsrc[&F] = std::move(taint_sources);
+        }
+
+        for (auto [fp, tsrc] : m_func2tsrc) {
+            if (taint_bcast_sink(tsrc)) {
+                m_taint_funcs.insert(fp);
+            }
+        }
+
+        size_t n_tfunc_before = 0;
+        do {
+            n_tfunc_before = m_taint_funcs.size();
+            for (auto f : m_taint_funcs) {
+                if (!is_taint_src(f->getName())) {
+                    taint_bcast_sink(f->args());
+                }
+            }
+        } while (n_tfunc_before != m_taint_funcs.size());
 
         constexpr size_t max_try = 128;
         size_t try_count = 0;
@@ -629,32 +683,31 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
     void init_ranges(Module& M)
     {
-        for (auto& F : M) {
-            if (F.getReturnType()->isIntegerTy() || is_taint_src(F.getName())) {
-                if (F.isDeclaration()) {
-                    m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), true); // full.
-                    MKINT_LOG() << "Skip range analysis for func w/o impl: " << F.getName();
-                } else {
-                    if (F.getReturnType()->isIntegerTy())
-                        m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), false); // empty.
+        for (auto& fp : m_taint_funcs) {
+            auto& F = *fp;
+            // Functions for range analysis:
+            // 1. taint source -> taint sink
+            if (F.isDeclaration()) {
+                m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), true); // full.
+                MKINT_LOG() << "Skip range analysis for func w/o impl: " << F.getName();
+            } else {
+                if (F.getReturnType()->isIntegerTy())
+                    m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), false); // empty.
 
-                    // init the arg range
-                    auto& init_blk = m_func2range_info[&F][&(F.getEntryBlock())];
-                    for (const auto& arg : F.args()) {
-                        if (arg.getType()->isIntegerTy()) {
-                            // be conservative first.
-                            // TODO: fine-grained arg range (some taint, some not)
-                            if (is_taint_src(F.getName())) { // for taint source, we assume full set.
-                                init_blk[&arg] = crange(arg.getType()->getIntegerBitWidth(), true);
-                            } else {
-                                init_blk[&arg] = crange(arg.getType()->getIntegerBitWidth(), false);
-                            }
+                // init the arg range
+                auto& init_blk = m_func2range_info[&F][&(F.getEntryBlock())];
+                for (const auto& arg : F.args()) {
+                    if (arg.getType()->isIntegerTy()) {
+                        // be conservative first.
+                        // TODO: fine-grained arg range (some taint, some not)
+                        if (is_taint_src(F.getName())) { // for taint source, we assume full set.
+                            init_blk[&arg] = crange(arg.getType()->getIntegerBitWidth(), true);
+                        } else {
+                            init_blk[&arg] = crange(arg.getType()->getIntegerBitWidth(), false);
                         }
                     }
-                    m_range_analysis_funcs.insert(&F);
                 }
-            } else {
-                MKINT_LOG() << "Skip range analysis for non-integer func: " << F.getName();
+                m_range_analysis_funcs.insert(&F);
             }
         }
 
@@ -707,7 +760,8 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
     }
 
 private:
-    MapVector<StringRef, std::vector<Instruction*>> m_func2tsrc;
+    MapVector<Function*, std::vector<Instruction*>> m_func2tsrc;
+    SetVector<Function*> m_taint_funcs;
     DenseMap<const BasicBlock*, SetVector<const BasicBlock*>> m_backedges;
 
     // for range analysis

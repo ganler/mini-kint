@@ -12,9 +12,12 @@
 
 constexpr const char* LOG_ENV_VAR = "MKINT_LOG";
 
-constexpr const char* LOG_PROMPT = "[MKint::LOG]";
+constexpr const char* LOG_PROMPT = "[MKint::LOG  ]";
 constexpr auto LOG_STYLE_FG = rang::fg::green;
 constexpr auto LOG_STYLE_BG = rang::bg::gray;
+
+constexpr const char* WARN_PROMPT = "[MKint::WARN ]";
+constexpr auto WARN_STYLE_FG = rang::fg::yellow;
 
 constexpr const char* CHECK_PROMPT = "[MKint::CHECK]";
 constexpr auto CHECK_STYLE_FG = rang::fg::red;
@@ -108,6 +111,11 @@ mkint::detail::log_wrapper mkint::log()
 mkint::detail::log_wrapper mkint::debug()
 {
     return mkint::detail::log_wrapper(s_log_stream, DEBUG_STYLE_FG, DEBUG_STYLE_BG, DEBUG_PROMPT, rang::style::reset, '\t');
+}
+
+mkint::detail::log_wrapper mkint::warn()
+{
+    return mkint::detail::log_wrapper(s_log_stream, WARN_STYLE_FG, WARN_PROMPT, rang::style::reset, '\t');
 }
 
 mkint::detail::log_wrapper mkint::check(bool cond, bool abort, std::string_view prompt, std::string_view file, size_t line)
