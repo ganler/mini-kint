@@ -25,6 +25,7 @@
 #include <llvm/Passes/PassPlugin.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Transforms/Utils/Mem2Reg.h>
 
 #include <z3++.h>
 
@@ -724,6 +725,8 @@ extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK llvmGetPassPluginIn
                 PB.registerPipelineParsingCallback(
                     [](StringRef Name, ModulePassManager& MPM, ArrayRef<PassBuilder::PipelineElement>) {
                         if (Name == "mkint-pass") {
+                            // do mem2reg.
+                            MPM.addPass(createModuleToFunctionPassAdaptor(PromotePass()));
                             MPM.addPass(MKintPass());
                             return true;
                         }
@@ -734,4 +737,5 @@ extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK llvmGetPassPluginIn
 
 // the version number must match!
 // get llvm ir: clang -Os -S -emit-llvm a.c
+// or         : clang -O0 -Xclang -disable-O0-optnone -emit-llvm -S a.cpp
 // test: opt -load-pass-plugin mkint/MiniKintPass.so -passes=mkint-pass -S a.ll
