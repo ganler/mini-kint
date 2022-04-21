@@ -62,7 +62,8 @@ template <typename V, typename... Vs> static constexpr std::array<V, sizeof...(V
 }
 
 constexpr auto MKINT_SINKS = mkarray<std::pair<const char*, size_t>>(std::pair { "malloc", 0 },
-    std::pair { "xmalloc", 0 }, std::pair { "kmalloc", 0 }, std::pair { "kzalloc", 0 }, std::pair { "vmalloc", 0 });
+    std::pair { "__mkint_sink0", 0 }, std::pair { "__mkint_sink1", 1 }, std::pair { "xmalloc", 0 },
+    std::pair { "kmalloc", 0 }, std::pair { "kzalloc", 0 }, std::pair { "vmalloc", 0 });
 
 struct crange : public ConstantRange {
     /// https://llvm.org/doxygen/classllvm_1_1ConstantRange.html
@@ -160,7 +161,7 @@ static std::vector<Instruction*> get_taint_source(Function& F)
                 continue;
             }
             auto call_name = name.str() + ".mkint.arg" + std::to_string(arg.getArgNo());
-            MKINT_LOG() << "Replacing taint arg -> call inst: " << call_name;
+            MKINT_LOG() << "Taint Analysis -> taint src arg -> call inst: " << call_name;
             auto call_inst = CallInst::Create(F.getParent()->getOrInsertFunction(call_name, itype), arg.getName(),
                 &*F.getEntryBlock().getFirstInsertionPt());
             ret.push_back(call_inst);
@@ -171,34 +172,6 @@ static std::vector<Instruction*> get_taint_source(Function& F)
 }
 
 static bool is_taint_src_arg_call(StringRef s) { return s.contains(".mkint.arg"); }
-
-static void mark_func_sinks(Function& F)
-{
-    static auto mark_sink = [](Instruction& inst, std::string_view sink_name) {
-        auto& ctx = inst.getContext();
-        auto md = MDNode::get(ctx, MDString::get(ctx, sink_name));
-        inst.setMetadata(MKINT_IR_SINK, md);
-    };
-
-    for (auto& inst : instructions(F)) {
-        if (auto* call = dyn_cast<CallInst>(&inst)) {
-            // call in MKINT_SINKS
-            for (const auto& [name, idx] : MKINT_SINKS) {
-                const auto demangled_func_name = demangle(call->getCalledFunction()->getName().str().c_str());
-                if (demangled_func_name == name) {
-                    if (auto inst = dyn_cast_or_null<Instruction>(call->getArgOperand(idx))) {
-                        MKINT_LOG() << "Marking sink: " << demangled_func_name;
-                        mark_sink(*inst, name);
-                    }
-                    break;
-                } else if (StringRef(demangled_func_name).startswith(name)) {
-                    MKINT_WARN() << "Are you missing the sink? [demangled_func_name]: " << demangled_func_name
-                                 << "; [name]: " << name;
-                }
-            }
-        }
-    }
-}
 
 std::pair<crange, crange> auto_promote(crange lhs, crange rhs)
 {
@@ -500,7 +473,13 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                         new_range = new_range.unionWith(get_range_by_bb(op->getIncomingValue(i), pred));
                     }
                 } else if (const auto op = dyn_cast<LoadInst>(&inst)) {
-                    new_range = get_rng(op->getPointerOperand());
+                    const auto addr = op->getPointerOperand();
+                    if (dyn_cast<GlobalVariable>(addr))
+                        new_range = get_rng(addr);
+                    else {
+                        MKINT_WARN() << "Cannot analyze unknown address: " << inst;
+                        new_range = crange(op->getType()->getIntegerBitWidth()); // unknown addr -> full range.
+                    }
                 } else if (const auto op = dyn_cast<CmpInst>(&inst)) {
                     // can be more precise by comparing the range...
                     // but nah...
@@ -513,6 +492,22 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }
     }
 
+    static SmallVector<Function*, 2> get_sink_fns(Instruction* inst) noexcept
+    {
+        SmallVector<Function*, 2> ret;
+        for (auto user : inst->users()) {
+            if (auto call = dyn_cast<CallInst>(user)) {
+                auto dname = demangle(call->getCalledFunction()->getName().data());
+                if (std::find_if(
+                        MKINT_SINKS.begin(), MKINT_SINKS.end(), [&dname](const auto& s) { return dname == s.first; })
+                    != MKINT_SINKS.end()) {
+                    ret.push_back(call->getCalledFunction());
+                }
+            }
+        }
+        return ret;
+    }
+
     bool is_sink_reachable(Instruction* inst)
     {
         // we want to only mark sink-reachable taints; and
@@ -520,6 +515,9 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         if (nullptr == inst) {
             return false;
         } else if (inst->getMetadata(MKINT_IR_SINK)) {
+            for (auto f : get_sink_fns(inst)) {
+                m_taint_funcs.insert(f);
+            }
             return true;
         }
 
@@ -529,7 +527,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         if (auto store = dyn_cast<StoreInst>(inst)) {
             auto ptr = store->getPointerOperand();
             if (auto gv = dyn_cast<GlobalVariable>(ptr)) {
-                for (const auto& user : gv->users()) {
+                for (auto user : gv->users()) {
                     if (auto user_inst = dyn_cast<Instruction>(user)) {
                         if (user != store) // no self-loop.
                             you_see_sink |= is_sink_reachable(user_inst);
@@ -621,6 +619,60 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         return ret;
     }
 
+    void mark_func_sinks(Function& F)
+    {
+        static auto mark_sink = [](Instruction& inst, std::string_view sink_name) {
+            auto& ctx = inst.getContext();
+            auto md = MDNode::get(ctx, MDString::get(ctx, sink_name));
+            inst.setMetadata(MKINT_IR_SINK, md);
+        };
+
+        for (auto& inst : instructions(F)) {
+            if (auto* call = dyn_cast<CallInst>(&inst)) {
+                // call in MKINT_SINKS
+                for (const auto& [name, idx] : MKINT_SINKS) {
+                    const auto demangled_func_name = demangle(call->getCalledFunction()->getName().str().c_str());
+                    if (demangled_func_name == name) {
+                        if (auto arg = dyn_cast_or_null<Instruction>(call->getArgOperand(idx))) {
+                            MKINT_LOG() << "Taint Analysis -> sink: argument [" << idx << "] of "
+                                        << demangled_func_name;
+                            mark_sink(*arg, name);
+                        }
+                        break;
+                    } else if (StringRef(demangled_func_name).startswith(name)) {
+                        MKINT_WARN() << "Are you missing the sink? [demangled_func_name]: " << demangled_func_name
+                                     << "; [name]: " << name;
+                    }
+                }
+            }
+        }
+
+        // if this function is taint source and has a return value used non-taint-source functions, we mark its return
+        // statement as sink. this is because its return value can be used by, say kernel functions.
+        if (is_taint_src(F.getName()) && F.getReturnType()->isIntegerTy() && !F.use_empty()) {
+
+            // if there is any users.
+            bool valid_use = false;
+            for (auto user : F.users()) {
+                if (auto user_inst = dyn_cast<Instruction>(user)) {
+                    if (!is_taint_src(user_inst->getParent()->getParent()->getName())) {
+                        valid_use = true;
+                        break;
+                    }
+                }
+            }
+            if (!valid_use)
+                return;
+
+            for (auto& inst : instructions(F)) {
+                if (dyn_cast<ReturnInst>(&inst)) {
+                    MKINT_LOG() << "Taint Analysis -> sink: return inst of " << F.getName();
+                    mark_sink(inst, "return");
+                }
+            }
+        }
+    }
+
     PreservedAnalyses run(Module& M, ModuleAnalysisManager& MAM)
     {
         MKINT_LOG() << "Running MKint pass on module " << M.getName();
@@ -629,7 +681,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         for (auto& F : M) {
             auto taint_sources = get_taint_source(F);
             mark_func_sinks(F);
-            if (!taint_sources.empty())
+            if (is_taint_src(F.getName()))
                 m_func2tsrc[&F] = std::move(taint_sources);
         }
 
