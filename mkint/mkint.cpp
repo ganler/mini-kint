@@ -328,6 +328,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                             }
 
                             if (cur_rng[lhs].isEmptySet() || cur_rng[rhs].isEmptySet()) {
+                                // TODO: higher precision.
                                 m_impossible_branches[cmp] = is_true_br;
                             }
 
@@ -819,9 +820,9 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
         MKINT_LOG() << "============ Impossible Branches ============";
         for (auto [cmp, is_tbr] : m_impossible_branches) {
-            MKINT_WARN() << rang::bg::black << rang::fg::red << *cmp << rang::style::reset << " on the "
-                         << rang::fg::red << rang::style::italic << (is_tbr ? "true" : "false") << rang::style::reset
-                         << " branch (Function: " << cmp->getFunction()->getName() << ")";
+            MKINT_WARN() << rang::bg::black << rang::fg::red << cmp->getFunction()->getName() << "::" << *cmp
+                         << rang::style::reset << "'s " << rang::fg::red << rang::style::italic
+                         << (is_tbr ? "true" : "false") << rang::style::reset << " branch";
         }
     }
 
