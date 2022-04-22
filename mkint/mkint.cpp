@@ -775,7 +775,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         for (const auto& GV : M.globals()) {
             MKINT_LOG() << "Found global var " << GV.getName() << " of type " << *GV.getType();
             // TODO: handle struct (ptr); array (ptr)
-            if (GV.getType()->isIntegerTy()) {
+            if (GV.getValueType()->isIntegerTy()) {
                 if (GV.hasInitializer()) {
                     auto init_val = dyn_cast<ConstantInt>(GV.getInitializer())->getValue();
                     MKINT_LOG() << GV.getName() << " init by " << init_val;
@@ -783,6 +783,26 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 } else {
                     m_global2range[&GV] = crange(GV.getType()->getIntegerBitWidth()); // can be all range.
                 }
+            } else if (GV.getValueType()->isArrayTy()) { // int array.
+                const auto garr = dyn_cast<ArrayType>(GV.getValueType());
+                if (GV.hasInitializer()) {
+                    if (auto darr = dyn_cast<ConstantDataArray>(GV.getInitializer())) {
+                        for (size_t i = 0; i < darr->getNumElements(); i++) {
+                            auto init_val = dyn_cast<ConstantInt>(darr->getElementAsConstant(i))->getValue();
+                            MKINT_LOG() << GV.getName() << "[" << i << "] init by " << init_val;
+                            m_garr2ranges[&GV].push_back(crange(init_val));
+                        }
+                    } else {
+                        MKINT_CHECK_ABORT(false) << "Unsupported initializer for global array: " << GV.getName();
+                    }
+                } else {
+                    for (size_t i = 0; i < garr->getNumElements(); i++) {
+                        m_garr2ranges[&GV].push_back( // can be anything
+                            crange(garr->getElementType()->getIntegerBitWidth(), true));
+                    }
+                }
+            } else {
+                MKINT_WARN() << "Unhandled global var type: " << *GV.getType() << " -> " << GV.getName();
             }
         }
     }
@@ -836,6 +856,7 @@ private:
     std::map<const Function*, crange> m_func2ret_range;
     SetVector<const Function*> m_range_analysis_funcs;
     std::map<const GlobalValue*, crange> m_global2range;
+    std::map<const GlobalValue*, SmallVector<crange, 4>> m_garr2ranges;
     std::map<const ICmpInst*, bool> m_impossible_branches;
 };
 } // namespace
