@@ -775,7 +775,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         for (const auto& GV : M.globals()) {
             MKINT_LOG() << "Found global var " << GV.getName() << " of type " << *GV.getType();
             // TODO: handle struct (ptr); array (ptr)
-            if (GV.getType()->isIntOrPtrTy()) {
+            if (GV.getType()->isIntegerTy()) {
                 if (GV.hasInitializer()) {
                     auto init_val = dyn_cast<ConstantInt>(GV.getInitializer())->getValue();
                     MKINT_LOG() << GV.getName() << " init by " << init_val;
