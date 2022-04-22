@@ -735,31 +735,33 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
     void init_ranges(Module& M)
     {
-        for (auto& fp : m_taint_funcs) {
-            auto& F = *fp;
+        for (auto& F : M) {
             // Functions for range analysis:
-            // 1. taint source -> taint sink
-            if (F.isDeclaration()) {
-                m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), true); // full.
-                MKINT_LOG() << "Skip range analysis for func w/o impl: " << F.getName();
-            } else {
-                if (F.getReturnType()->isIntegerTy())
-                    m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), false); // empty.
+            // 1. taint source -> taint sink.
+            // 2. integer functions.
+            if (F.getReturnType()->isIntegerTy() || m_taint_funcs.contains(&F)) {
+                if (F.isDeclaration()) {
+                    m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), true); // full.
+                    MKINT_LOG() << "Skip range analysis for func w/o impl: " << F.getName();
+                } else {
+                    if (F.getReturnType()->isIntegerTy())
+                        m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), false); // empty.
 
-                // init the arg range
-                auto& init_blk = m_func2range_info[&F][&(F.getEntryBlock())];
-                for (const auto& arg : F.args()) {
-                    if (arg.getType()->isIntegerTy()) {
-                        // be conservative first.
-                        // TODO: fine-grained arg range (some taint, some not)
-                        if (is_taint_src(F.getName())) { // for taint source, we assume full set.
-                            init_blk[&arg] = crange(arg.getType()->getIntegerBitWidth(), true);
-                        } else {
-                            init_blk[&arg] = crange(arg.getType()->getIntegerBitWidth(), false);
+                    // init the arg range
+                    auto& init_blk = m_func2range_info[&F][&(F.getEntryBlock())];
+                    for (const auto& arg : F.args()) {
+                        if (arg.getType()->isIntegerTy()) {
+                            // be conservative first.
+                            // TODO: fine-grained arg range (some taint, some not)
+                            if (is_taint_src(F.getName())) { // for taint source, we assume full set.
+                                init_blk[&arg] = crange(arg.getType()->getIntegerBitWidth(), true);
+                            } else {
+                                init_blk[&arg] = crange(arg.getType()->getIntegerBitWidth(), false);
+                            }
                         }
                     }
+                    m_range_analysis_funcs.insert(&F);
                 }
-                m_range_analysis_funcs.insert(&F);
             }
         }
 
