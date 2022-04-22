@@ -302,7 +302,8 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                             if (cur_rng.count(rhs) == 0)
                                 cur_rng[rhs] = crange(rhs->getType()->getIntegerBitWidth(), false);
 
-                            if (br->getSuccessor(0) == bb) { // T branch
+                            bool is_true_br = br->getSuccessor(0) == bb;
+                            if (is_true_br) { // T branch
                                 crange lprng = crange::cmpRegion()(cmp->getPredicate(), rrng);
                                 crange rprng = crange::cmpRegion()(cmp->getSwappedPredicate(), lrng);
 
@@ -324,6 +325,10 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                                 cur_rng[rhs] = dyn_cast<ConstantInt>(rhs)
                                     ? rrng
                                     : rrng.intersectWith(rprng).unionWith(cur_rng[rhs]);
+                            }
+
+                            if (cur_rng[lhs].isEmptySet() || cur_rng[rhs].isEmptySet()) {
+                                m_impossible_branches[cmp] = is_true_br;
                             }
 
                             narrowed_insts.insert(lhs);
@@ -793,7 +798,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             MKINT_LOG() << rang::bg::black << rang::fg::blue << GV->getName() << rang::style::reset << " -> " << rng;
         }
 
-        MKINT_LOG() << "============ Function Inst Ranges ===========";
+        MKINT_LOG() << "============ Function Inst Ranges ============";
         for (const auto& [F, blk2rng] : m_func2range_info) {
             MKINT_LOG() << " ----------- Function Name : " << rang::bg::black << rang::fg::green << F->getName()
                         << rang::style::reset;
@@ -811,6 +816,13 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 }
             }
         }
+
+        MKINT_LOG() << "============ Impossible Branches ============";
+        for (auto [cmp, is_tbr] : m_impossible_branches) {
+            MKINT_WARN() << rang::bg::black << rang::fg::red << *cmp << rang::style::reset << " on the "
+                         << rang::fg::red << rang::style::italic << (is_tbr ? "true" : "false") << rang::style::reset
+                         << " branch (Function: " << cmp->getFunction()->getName() << ")";
+        }
     }
 
 private:
@@ -823,6 +835,7 @@ private:
     std::map<const Function*, crange> m_func2ret_range;
     SetVector<const Function*> m_range_analysis_funcs;
     std::map<const GlobalValue*, crange> m_global2range;
+    std::map<const ICmpInst*, bool> m_impossible_branches;
 };
 } // namespace
 
