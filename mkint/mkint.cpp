@@ -419,7 +419,25 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                     if (const auto gv = dyn_cast<GlobalVariable>(ptr)) {
                         // should be lazy mode. check local vars first and then check global vars.
                         m_global2range[gv] = m_global2range[gv].unionWith(valrng);
+                    } else if (const auto gep = dyn_cast<GetElementPtrInst>(ptr)) {
+                        auto gep_addr = gep->getPointerOperand();
+                        if (auto garr = dyn_cast<GlobalVariable>(gep_addr)) {
+                            if (m_garr2ranges.count(garr) && gep->getNumIndices() == 2) { // all one dim array<int>s!
+                                auto idx = gep->getOperand(2);
+                                const size_t arr_size = m_garr2ranges[garr].size();
+                                const crange idx_rng = get_rng(idx);
+                                const size_t idx_max = idx_rng.getUnsignedMax().getLimitedValue();
+                                if (idx_max >= arr_size)
+                                    m_gep_oob.insert(gep);
+
+                                for (size_t i = idx_rng.getUnsignedMin().getLimitedValue();
+                                     i < std::min(arr_size, idx_max); ++i) {
+                                    m_garr2ranges[garr][i] = m_garr2ranges[garr][i].unionWith(valrng);
+                                }
+                            }
+                        }
                     }
+
                     // is local var
                     cur_rng[ptr] = valrng; // better precision.
                     continue;
@@ -484,6 +502,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                     if (dyn_cast<GlobalVariable>(addr))
                         new_range = get_rng(addr);
                     else if (auto gep = dyn_cast<GetElementPtrInst>(addr)) {
+                        bool succ = false;
                         // we only analyze shallow arrays. i.e., one dim.
                         auto gep_addr = gep->getPointerOperand();
                         if (auto garr = dyn_cast<GlobalVariable>(gep_addr)) {
@@ -494,15 +513,21 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                                 const size_t idx_max = idx_rng.getUnsignedMax().getLimitedValue();
                                 if (idx_max >= arr_size) {
                                     m_gep_oob.insert(gep);
-                                } else {
-                                    for (size_t i = idx_rng.getUnsignedMin().getLimitedValue(); i < arr_size; ++i) {
-                                        new_range = new_range.unionWith(m_garr2ranges[garr][i]);
-                                    }
                                 }
+
+                                for (size_t i = idx_rng.getUnsignedMin().getLimitedValue();
+                                     i < std::min(arr_size, idx_max); ++i) {
+                                    new_range = new_range.unionWith(m_garr2ranges[garr][i]);
+                                }
+
+                                succ = true;
                             }
                         }
-                        MKINT_WARN() << "Unknown address to load (unknow gep src addr): " << inst;
-                        new_range = crange(op->getType()->getIntegerBitWidth()); // unknown addr -> full range.
+
+                        if (!succ) {
+                            MKINT_WARN() << "Unknown address to load (unknow gep src addr): " << inst;
+                            new_range = crange(op->getType()->getIntegerBitWidth()); // unknown addr -> full range.
+                        }
                     } else {
                         MKINT_WARN() << "Unknown address to load: " << inst;
                         new_range = crange(op->getType()->getIntegerBitWidth()); // unknown addr -> full range.
@@ -741,13 +766,15 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         while (true) { // iterative range analysis.
             const auto old_fn_rng = m_func2range_info;
             const auto old_glb_rng = m_global2range;
+            const auto old_glb_arrrng = m_garr2ranges;
             const auto old_fn_ret_rng = m_func2ret_range;
 
             for (auto F : m_range_analysis_funcs) {
                 range_analysis(*F);
             }
 
-            if (m_func2range_info == old_fn_rng && old_glb_rng == m_global2range && old_fn_ret_rng == m_func2ret_range)
+            if (m_func2range_info == old_fn_rng && old_glb_rng == m_global2range && old_fn_ret_rng == m_func2ret_range
+                && old_glb_arrrng == m_garr2ranges)
                 break;
             if (++try_count > max_try) {
                 MKINT_LOG() << "[Iterative Range Analysis] "
@@ -903,8 +930,8 @@ private:
     std::map<const Function*, bbrange_t> m_func2range_info;
     std::map<const Function*, crange> m_func2ret_range;
     SetVector<Function*> m_range_analysis_funcs;
-    std::map<const GlobalValue*, crange> m_global2range;
-    std::map<const GlobalValue*, SmallVector<crange, 4>> m_garr2ranges;
+    std::map<const GlobalVariable*, crange> m_global2range;
+    std::map<const GlobalVariable*, SmallVector<crange, 4>> m_garr2ranges;
 
     // for error checking
     std::map<ICmpInst*, bool> m_impossible_branches;
