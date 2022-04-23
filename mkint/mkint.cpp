@@ -2,6 +2,7 @@
 #include "rang.hpp"
 #include "smt.hpp"
 
+#include <cstddef>
 #include <cxxabi.h>
 
 #include <llvm/ADT/DenseMap.h>
@@ -48,6 +49,7 @@ using namespace llvm;
 constexpr const char* MKINT_IR_TAINT = "mkint.taint";
 constexpr const char* MKINT_IR_SINK = "mkint.sink";
 constexpr const char* MKINT_IR_ERR = "mkint.err";
+constexpr const char* MKINT_TAINT_SRC_SUFFX = ".mkint.arg";
 
 static std::string demangle(const char* name)
 {
@@ -147,9 +149,9 @@ static bool is_taint_src(StringRef sv)
     return name.startswith("sys_") || name.startswith("__mkint_ann_");
 }
 
-static std::vector<Instruction*> get_taint_source(Function& F)
+static std::vector<CallInst*> get_taint_source(Function& F)
 {
-    std::vector<Instruction*> ret;
+    std::vector<CallInst*> ret;
     // judge if this function is the taint source.
     const auto name = F.getName();
     if (is_taint_src(name)) {
@@ -161,7 +163,7 @@ static std::vector<Instruction*> get_taint_source(Function& F)
             if (nullptr == itype || arg.use_empty()) {
                 continue;
             }
-            auto call_name = name.str() + ".mkint.arg" + std::to_string(arg.getArgNo());
+            auto call_name = name.str() + MKINT_TAINT_SRC_SUFFX + std::to_string(arg.getArgNo());
             MKINT_LOG() << "Taint Analysis -> taint src arg -> call inst: " << call_name;
             auto call_inst = CallInst::Create(F.getParent()->getOrInsertFunction(call_name, itype), arg.getName(),
                 &*F.getEntryBlock().getFirstInsertionPt());
@@ -172,7 +174,7 @@ static std::vector<Instruction*> get_taint_source(Function& F)
     return ret;
 }
 
-static bool is_taint_src_arg_call(StringRef s) { return s.contains(".mkint.arg"); }
+static bool is_taint_src_arg_call(StringRef s) { return s.contains(MKINT_TAINT_SRC_SUFFX); }
 
 std::pair<crange, crange> auto_promote(crange lhs, crange rhs)
 {
@@ -399,10 +401,24 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 // Store / Call / Return
                 if (const auto call = dyn_cast<CallInst>(&inst)) {
                     if (const auto f = call->getCalledFunction()) {
-                        for (const auto& arg : f->args()) {
-                            auto& argblock = m_func2range_info[f][&(f->getEntryBlock())];
-                            if (arg.getType()->isIntegerTy())
-                                argblock[&arg] = get_rng(call->getArgOperand(arg.getArgNo())).unionWith(argblock[&arg]);
+                        if (m_callback_tsrc_fn.contains(f->getName())) {
+                            const auto& argcalls = m_func2tsrc[f];
+
+                            for (const auto& arg : f->args()) {
+                                auto& argblock = m_func2range_info[f][&(f->getEntryBlock())];
+                                const size_t arg_idx = arg.getArgNo();
+                                if (arg.getType()->isIntegerTy()) {
+                                    argblock[&arg] = get_rng(call->getArgOperand(arg_idx)).unionWith(argblock[&arg]);
+                                    m_func2ret_range[argcalls[arg_idx]->getCalledFunction()] = argblock[&arg];
+                                }
+                            }
+                        } else {
+                            for (const auto& arg : f->args()) {
+                                auto& argblock = m_func2range_info[f][&(f->getEntryBlock())];
+                                if (arg.getType()->isIntegerTy())
+                                    argblock[&arg]
+                                        = get_rng(call->getArgOperand(arg.getArgNo())).unionWith(argblock[&arg]);
+                            }
                         }
 
                         if (f->getReturnType()->isIntegerTy()) // return value is integer.
@@ -630,7 +646,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         return false;
     }
 
-    bool taint_bcast_sink(const std::vector<Instruction*>& taint_source)
+    bool taint_bcast_sink(const std::vector<CallInst*>& taint_source)
     {
         // ? Note we currently assume that sub-func-calls do not have sinks...
         // ? otherwise we need a use-def tree to do the job (but too complicated).
@@ -720,6 +736,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 if (dyn_cast<ReturnInst>(&inst)) {
                     MKINT_LOG() << "Taint Analysis -> sink: return inst of " << F.getName();
                     mark_sink(inst, "return");
+                    m_callback_tsrc_fn.insert(F.getName());
                 }
             }
         }
@@ -797,8 +814,15 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             // 2. integer functions.
             if (F.getReturnType()->isIntegerTy() || m_taint_funcs.contains(&F)) {
                 if (F.isDeclaration()) {
-                    m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), true); // full.
-                    MKINT_LOG() << "Skip range analysis for func w/o impl: " << F.getName();
+                    if (is_taint_src_arg_call(F.getName())
+                        && m_callback_tsrc_fn.contains(
+                            F.getName().substr(0, F.getName().size() - StringRef(MKINT_TAINT_SRC_SUFFX).size() - 1))) {
+                        m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), false);
+                        MKINT_LOG() << "Skip range analysis for func w/o impl [Empty Set]: " << F.getName();
+                    } else {
+                        m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), true); // full.
+                        MKINT_LOG() << "Skip range analysis for func w/o impl [Full Set]: " << F.getName();
+                    }
                 } else {
                     if (F.getReturnType()->isIntegerTy())
                         m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), false); // empty.
@@ -809,7 +833,8 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                         if (arg.getType()->isIntegerTy()) {
                             // be conservative first.
                             // TODO: fine-grained arg range (some taint, some not)
-                            if (is_taint_src(F.getName())) { // for taint source, we assume full set.
+                            if (is_taint_src(F.getName())
+                                && !m_callback_tsrc_fn.contains(F.getName())) { // for taint source, we assume full set.
                                 init_blk[&arg] = crange(arg.getType()->getIntegerBitWidth(), true);
                             } else {
                                 init_blk[&arg] = crange(arg.getType()->getIntegerBitWidth(), false);
@@ -869,6 +894,13 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             MKINT_LOG() << rang::bg::black << rang::fg::blue << GV->getName() << rang::style::reset << " -> " << rng;
         }
 
+        for (const auto& [GV, rng_vec] : m_garr2ranges) {
+            for (size_t i = 0; i < rng_vec.size(); i++) {
+                MKINT_LOG() << rang::bg::black << rang::fg::blue << GV->getName() << "[" << i << "]"
+                            << rang::style::reset << " -> " << rng_vec[i];
+            }
+        }
+
         MKINT_LOG() << "============ Function Inst Ranges ============";
         for (const auto& [F, blk2rng] : m_func2range_info) {
             MKINT_LOG() << " ----------- Function Name : " << rang::bg::black << rang::fg::green << F->getName()
@@ -922,9 +954,10 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
     }
 
 private:
-    MapVector<Function*, std::vector<Instruction*>> m_func2tsrc;
+    MapVector<Function*, std::vector<CallInst*>> m_func2tsrc;
     SetVector<Function*> m_taint_funcs;
     DenseMap<const BasicBlock*, SetVector<const BasicBlock*>> m_backedges;
+    SetVector<StringRef> m_callback_tsrc_fn;
 
     // for range analysis
     std::map<const Function*, bbrange_t> m_func2range_info;
@@ -936,6 +969,9 @@ private:
     // for error checking
     std::map<ICmpInst*, bool> m_impossible_branches;
     std::set<GetElementPtrInst*> m_gep_oob;
+    std::set<Instruction*> m_overflow_insts;
+    std::set<Instruction*> m_bad_shift_insts;
+    std::set<Instruction*> m_div_zero_insts;
 };
 } // namespace
 
