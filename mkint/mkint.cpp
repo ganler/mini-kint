@@ -97,13 +97,7 @@ namespace {
 
 using bbrange_t = DenseMap<const BasicBlock*, DenseMap<const Value*, crange>>;
 
-enum class interr {
-    OVERFLOW,
-    DIV_BY_ZERO,
-    BAD_SHIFT,
-    ARRAY_OOB,
-    IMPOSSIBLE_BR,
-};
+enum class interr { OVERFLOW, DIV_BY_ZERO, BAD_SHIFT, ARRAY_OOB, DEAD_TRUE_BR, DEAD_FALSE_BR };
 
 template <interr err, typename StrRet = const char*> constexpr StrRet mkstr()
 {
@@ -115,11 +109,13 @@ template <interr err, typename StrRet = const char*> constexpr StrRet mkstr()
         return "bad shift";
     } else if (err == interr::ARRAY_OOB) {
         return "array index out of bound";
-    } else if (err == interr::IMPOSSIBLE_BR) {
-        return "impossible branch";
+    } else if (err == interr::DEAD_TRUE_BR) {
+        return "impossible true branch";
+    } else if (err == interr::DEAD_FALSE_BR) {
+        return "impossible false branch";
     } else {
         static_assert(err == interr::OVERFLOW || err == interr::DIV_BY_ZERO || err == interr::BAD_SHIFT
-                || err == interr::ARRAY_OOB || err == interr::IMPOSSIBLE_BR,
+                || err == interr::ARRAY_OOB || err == interr::DEAD_TRUE_BR || err == interr::DEAD_FALSE_BR,
             "unknown error type");
         return ""; // statically impossible
     }
@@ -881,7 +877,10 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
     void mark_errors()
     {
         for (auto [cmp, is_tbr] : m_impossible_branches) {
-            mark_err<interr::IMPOSSIBLE_BR>(cmp);
+            if (is_tbr)
+                mark_err<interr::DEAD_TRUE_BR>(cmp);
+            else
+                mark_err<interr::DEAD_FALSE_BR>(cmp);
         }
 
         for (auto gep : m_gep_oob) {
