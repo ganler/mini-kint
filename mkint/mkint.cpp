@@ -98,38 +98,43 @@ namespace {
 using bbrange_t = DenseMap<const BasicBlock*, DenseMap<const Value*, crange>>;
 
 enum class interr {
-    OUT_OF_BOUND,
+    OVERFLOW,
     DIV_BY_ZERO,
     BAD_SHIFT,
-    NEG_IDX,
+    ARRAY_OOB,
     IMPOSSIBLE_BR,
 };
 
 template <interr err, typename StrRet = const char*> constexpr StrRet mkstr()
 {
-    if constexpr (err == interr::OUT_OF_BOUND) {
-        return "out of boundary";
+    if constexpr (err == interr::OVERFLOW) {
+        return "integer overflow";
     } else if (err == interr::DIV_BY_ZERO) {
         return "divide by zero";
     } else if (err == interr::BAD_SHIFT) {
         return "bad shift";
-    } else if (err == interr::NEG_IDX) {
-        return "negative index";
+    } else if (err == interr::ARRAY_OOB) {
+        return "array index out of bound";
     } else if (err == interr::IMPOSSIBLE_BR) {
         return "impossible branch";
     } else {
-        static_assert(err == interr::OUT_OF_BOUND || err == interr::DIV_BY_ZERO || err == interr::BAD_SHIFT
-                || err == interr::NEG_IDX || err == interr::IMPOSSIBLE_BR,
+        static_assert(err == interr::OVERFLOW || err == interr::DIV_BY_ZERO || err == interr::BAD_SHIFT
+                || err == interr::ARRAY_OOB || err == interr::IMPOSSIBLE_BR,
             "unknown error type");
         return ""; // statically impossible
     }
 }
 
-template <interr err_t, typename I> static void mark_err(I& inst)
+template <interr err_t, typename I> static std::enable_if_t<std::is_pointer_v<I>> mark_err(I inst)
 {
-    auto& ctx = inst.getContext();
+    auto& ctx = inst->getContext();
     auto md = MDNode::get(ctx, MDString::get(ctx, mkstr<err_t>()));
-    inst.setMetadata(MKINT_IR_ERR, md);
+    inst->setMetadata(MKINT_IR_ERR, md);
+}
+
+template <interr err_t, typename I> static std::enable_if_t<!std::is_pointer_v<I>> mark_err(I& inst)
+{
+    mark_err<err_t>(&inst);
 }
 
 static void mark_taint(Instruction& inst, std::string_view taint_name = "")
@@ -245,13 +250,13 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }
     }
 
-    void range_analysis(const Function& F)
+    void range_analysis(Function& F)
     {
         MKINT_LOG() << "Range Analysis -> " << F.getName();
 
         auto& bb_range = m_func2range_info[&F];
 
-        for (const auto& bbref : F) {
+        for (auto& bbref : F) {
             auto bb = &bbref;
 
             auto& cur_rng = bb_range[bb];
@@ -478,11 +483,25 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                         }
                         new_range = new_range.unionWith(get_range_by_bb(op->getIncomingValue(i), pred));
                     }
-                } else if (const auto op = dyn_cast<LoadInst>(&inst)) {
-                    const auto addr = op->getPointerOperand();
+                } else if (auto op = dyn_cast<LoadInst>(&inst)) {
+                    auto addr = op->getPointerOperand();
                     if (dyn_cast<GlobalVariable>(addr))
                         new_range = get_rng(addr);
-                    else {
+                    else if (auto gep = dyn_cast<GetElementPtrInst>(addr)) {
+                        // we only analyze shallow arrays. i.e., one dim.
+                        auto gep_addr = gep->getPointerOperand();
+                        if (auto garr = dyn_cast<GlobalVariable>(gep_addr)) {
+                            if (m_garr2ranges.count(garr) && gep->getNumIndices() == 2) { // all one dim array<int>s!
+                                auto idx = gep->getOperand(2);
+                                const size_t arr_size = m_garr2ranges[garr].size();
+                                const crange idx_rng = get_rng(idx);
+                                const size_t idx_max = idx_rng.getUnsignedMax().getLimitedValue();
+                                if (idx_max >= arr_size) {
+                                    m_gep_oob.insert(gep);
+                                }
+                            }
+                        }
+                    } else {
                         MKINT_WARN() << "Cannot analyze unknown address: " << inst;
                         new_range = crange(op->getType()->getIntegerBitWidth()); // unknown addr -> full range.
                     }
@@ -722,7 +741,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             const auto old_glb_rng = m_global2range;
             const auto old_fn_ret_rng = m_func2ret_range;
 
-            for (auto& F : m_range_analysis_funcs) {
+            for (auto F : m_range_analysis_funcs) {
                 range_analysis(*F);
             }
 
@@ -846,12 +865,27 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                          << rang::style::reset << "'s " << rang::fg::red << rang::style::italic
                          << (is_tbr ? "true" : "false") << rang::style::reset << " branch";
         }
+
+        MKINT_LOG() << "============ Array Index Out of Bound ============";
+        for (auto gep : m_gep_oob) {
+            MKINT_WARN() << rang::bg::black << rang::fg::red << gep->getFunction()->getName() << "::" << *gep
+                         << rang::style::reset << " may be out of bound";
+        }
     }
+
+    // for general: check overflow;
+    // for shl:     check shift amount;
+    // for div:     check divisor != 0;
+    void binary_check(const BinaryOperator*, const crange& lhs, const crange& rhs) { }
 
     void mark_errors()
     {
         for (auto [cmp, is_tbr] : m_impossible_branches) {
-            mark_err<interr::IMPOSSIBLE_BR>(*cmp);
+            mark_err<interr::IMPOSSIBLE_BR>(cmp);
+        }
+
+        for (auto gep : m_gep_oob) {
+            mark_err<interr::ARRAY_OOB>(gep);
         }
     }
 
@@ -863,10 +897,13 @@ private:
     // for range analysis
     std::map<const Function*, bbrange_t> m_func2range_info;
     std::map<const Function*, crange> m_func2ret_range;
-    SetVector<const Function*> m_range_analysis_funcs;
+    SetVector<Function*> m_range_analysis_funcs;
     std::map<const GlobalValue*, crange> m_global2range;
     std::map<const GlobalValue*, SmallVector<crange, 4>> m_garr2ranges;
+
+    // for error checking
     std::map<ICmpInst*, bool> m_impossible_branches;
+    std::set<GetElementPtrInst*> m_gep_oob;
 };
 } // namespace
 
