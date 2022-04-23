@@ -102,7 +102,7 @@ enum class interr {
     DIV_BY_ZERO,
     BAD_SHIFT,
     NEG_IDX,
-    VIOLATE_ANN,
+    IMPOSSIBLE_BR,
 };
 
 template <interr err, typename StrRet = const char*> constexpr StrRet mkstr()
@@ -115,17 +115,17 @@ template <interr err, typename StrRet = const char*> constexpr StrRet mkstr()
         return "bad shift";
     } else if (err == interr::NEG_IDX) {
         return "negative index";
-    } else if (err == interr::VIOLATE_ANN) {
-        return "annotation violation";
+    } else if (err == interr::IMPOSSIBLE_BR) {
+        return "impossible branch";
     } else {
         static_assert(err == interr::OUT_OF_BOUND || err == interr::DIV_BY_ZERO || err == interr::BAD_SHIFT
-                || err == interr::NEG_IDX || err == interr::VIOLATE_ANN,
+                || err == interr::NEG_IDX || err == interr::IMPOSSIBLE_BR,
             "unknown error type");
         return ""; // statically impossible
     }
 }
 
-template <interr err_t> static void mark_err(Instruction& inst)
+template <interr err_t, typename I> static void mark_err(I& inst)
 {
     auto& ctx = inst.getContext();
     auto md = MDNode::get(ctx, MDString::get(ctx, mkstr<err_t>()));
@@ -736,6 +736,8 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }
         this->pring_all_ranges();
 
+        this->mark_errors();
+
         return PreservedAnalyses::all();
     }
 
@@ -846,6 +848,13 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }
     }
 
+    void mark_errors()
+    {
+        for (auto [cmp, is_tbr] : m_impossible_branches) {
+            mark_err<interr::IMPOSSIBLE_BR>(*cmp);
+        }
+    }
+
 private:
     MapVector<Function*, std::vector<Instruction*>> m_func2tsrc;
     SetVector<Function*> m_taint_funcs;
@@ -857,7 +866,7 @@ private:
     SetVector<const Function*> m_range_analysis_funcs;
     std::map<const GlobalValue*, crange> m_global2range;
     std::map<const GlobalValue*, SmallVector<crange, 4>> m_garr2ranges;
-    std::map<const ICmpInst*, bool> m_impossible_branches;
+    std::map<ICmpInst*, bool> m_impossible_branches;
 };
 } // namespace
 

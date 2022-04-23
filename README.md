@@ -35,7 +35,6 @@ Consider the following cases for all integer expressions.
 - [ ] **shift**: observe if *shift(a, b) that b >= nbits*;
 - [ ] **array index**: observe if *arr\[idx\] that idx < 0*;
 - [x] **impossible branch**: e.g., ask a uint to be smaller than 0;
-- [ ] **user-mark**: observe if an user annotation is violated. e.g., data size is marked to be no less than 0.
 
 Use SMT solver to determine if these are possible and mark plausible ones (**the solution must be related to observable variables**).
 
