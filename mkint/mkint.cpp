@@ -494,11 +494,17 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                                 const size_t idx_max = idx_rng.getUnsignedMax().getLimitedValue();
                                 if (idx_max >= arr_size) {
                                     m_gep_oob.insert(gep);
+                                } else {
+                                    for (size_t i = idx_rng.getUnsignedMin().getLimitedValue(); i < arr_size; ++i) {
+                                        new_range = new_range.unionWith(m_garr2ranges[garr][i]);
+                                    }
                                 }
                             }
                         }
+                        MKINT_WARN() << "Unknown address to load (unknow gep src addr): " << inst;
+                        new_range = crange(op->getType()->getIntegerBitWidth()); // unknown addr -> full range.
                     } else {
-                        MKINT_WARN() << "Cannot analyze unknown address: " << inst;
+                        MKINT_WARN() << "Unknown address to load: " << inst;
                         new_range = crange(op->getType()->getIntegerBitWidth()); // unknown addr -> full range.
                     }
                 } else if (const auto op = dyn_cast<CmpInst>(&inst)) {
@@ -865,7 +871,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         MKINT_LOG() << "============ Array Index Out of Bound ============";
         for (auto gep : m_gep_oob) {
             MKINT_WARN() << rang::bg::black << rang::fg::red << gep->getFunction()->getName() << "::" << *gep
-                         << rang::style::reset << " may be out of bound";
+                         << rang::style::reset;
         }
     }
 
