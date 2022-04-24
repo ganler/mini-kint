@@ -1,6 +1,5 @@
 #include "log.hpp"
 #include "rang.hpp"
-#include "smt.hpp"
 
 #include <cxxabi.h>
 
@@ -982,9 +981,9 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         z3::context ctx;
         z3::solver s(ctx);
 
-        // create a bit vector variable
-        z3::expr lhs_bv = ctx.bv_const("lhs", lhs.getBitWidth());
-        z3::expr rhs_bv = ctx.bv_const("rhs", rhs.getBitWidth());
+        // create a int symbol
+        z3::expr lhs_iv = ctx.int_const("lhs");
+        z3::expr rhs_iv = ctx.int_const("rhs");
 
         const auto [is_nsw, is_nuw] = [op] {
             if (const auto ofop = dyn_cast<OverflowingBinaryOperator>(op)) {
@@ -994,30 +993,36 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }();
 
         const auto add_signed_cons = [&] {
-            s.add(lhs_bv <= ctx.bv_val(lhs.getSignedMax().getSExtValue(), lhs.getBitWidth()), "lhs_signed_max");
-            s.add(lhs_bv >= ctx.bv_val(lhs.getSignedMin().getSExtValue(), lhs.getBitWidth()), "lhs_signed_min");
-            s.add(rhs_bv <= ctx.bv_val(rhs.getSignedMax().getSExtValue(), rhs.getBitWidth()), "rhs_signed_max");
-            s.add(rhs_bv >= ctx.bv_val(rhs.getSignedMin().getSExtValue(), rhs.getBitWidth()), "rhs_signed_min");
-            MKINT_WARN() << "lhs range: " << lhs << " rhs range: " << rhs;
-            // MKINT_LOG() << s.assertions();
+            s.add(lhs_iv <= ctx.int_val(lhs.getSignedMax().getSExtValue()), "lhs_signed_max");
+            s.add(lhs_iv >= ctx.int_val(lhs.getSignedMin().getSExtValue()), "lhs_signed_min");
+            s.add(rhs_iv <= ctx.int_val(rhs.getSignedMax().getSExtValue()), "rhs_signed_max");
+            s.add(rhs_iv >= ctx.int_val(rhs.getSignedMin().getSExtValue()), "rhs_signed_min");
         };
 
         const auto add_unsigned_cons = [&] {
-            s.add(lhs_bv <= ctx.bv_val(lhs.getUnsignedMax().getZExtValue(), lhs.getBitWidth()), "lhs_unsigned_max");
-            s.add(lhs_bv >= ctx.bv_val(lhs.getUnsignedMin().getZExtValue(), lhs.getBitWidth()), "lhs_unsigned_min");
-            s.add(rhs_bv <= ctx.bv_val(rhs.getUnsignedMax().getZExtValue(), rhs.getBitWidth()), "rhs_unsigned_max");
-            s.add(rhs_bv >= ctx.bv_val(rhs.getUnsignedMin().getZExtValue(), rhs.getBitWidth()), "rhs_unsigned_min");
-            MKINT_WARN() << "lhs range: " << lhs << " rhs range: " << rhs;
-            // MKINT_LOG() << s.assertions();
+            s.add(lhs_iv <= ctx.int_val(lhs.getUnsignedMax().getZExtValue()), "lhs_unsigned_max");
+            s.add(lhs_iv >= ctx.int_val(lhs.getUnsignedMin().getZExtValue()), "lhs_unsigned_min");
+            s.add(rhs_iv <= ctx.int_val(rhs.getUnsignedMax().getZExtValue()), "rhs_unsigned_max");
+            s.add(rhs_iv >= ctx.int_val(rhs.getUnsignedMin().getZExtValue()), "rhs_unsigned_min");
+        };
+
+        const auto may_signed_overflow = [&](z3::expr result, size_t nbit) {
+            int64_t smin = APInt::getSignedMinValue(nbit).getSExtValue();
+            int64_t smax = APInt::getSignedMaxValue(nbit).getSExtValue();
+            return result < ctx.int_val(smin) || result > ctx.int_val(smax);
+        };
+
+        const auto may_unsigned_overflow = [&](z3::expr result, size_t nbit) {
+            uint64_t umin = APInt::getMinValue(nbit).getZExtValue();
+            uint64_t umax = APInt::getMaxValue(nbit).getZExtValue();
+            return result < ctx.int_val(umin) || result > ctx.int_val(umax);
         };
 
         const auto check = [&](interr et) {
-            MKINT_LOG() << s.assertions();
-            if (s.check() == z3::unsat) { // counter example
-                MKINT_WARN() << s.unsat_core();
+            if (s.check() == z3::sat) { // counter example
                 z3::model m = s.get_model();
                 MKINT_WARN() << mkstr(et) << " at " << *op;
-                MKINT_WARN() << op->getOpcodeName() << '(' << m.eval(rhs_bv, true) << ", " << m.eval(rhs_bv, true)
+                MKINT_WARN() << op->getOpcodeName() << '(' << m.eval(lhs_iv, true) << ", " << m.eval(rhs_iv, true)
                              << ')';
                 switch (et) {
                 case interr::OVERFLOW:
@@ -1037,15 +1042,14 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
         switch (op->getOpcode()) {
         case Instruction::Add:
-            if (!is_nsw) {
+            if (!is_nsw) { // unsigned
                 if (!is_nsw && !is_nuw)
                     MKINT_WARN() << "Strange ... This inst is neither nsw/nuw: " << *op;
                 add_unsigned_cons();
-                s.add(z3::bvadd_no_overflow(lhs_bv, rhs_bv, false));
+                s.add(may_unsigned_overflow(lhs_iv + rhs_iv, op->getType()->getIntegerBitWidth()));
             } else {
                 add_signed_cons();
-                s.add(z3::bvadd_no_overflow(lhs_bv, rhs_bv, true));
-                s.add(z3::bvadd_no_underflow(lhs_bv, rhs_bv));
+                s.add(may_signed_overflow(lhs_iv + rhs_iv, op->getType()->getIntegerBitWidth()));
             }
 
             check(interr::OVERFLOW);
@@ -1055,11 +1059,10 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 if (!is_nsw && !is_nuw)
                     MKINT_WARN() << "Strange ... This inst is neither nsw/nuw: " << *op;
                 add_unsigned_cons();
-                s.add(z3::bvsub_no_underflow(lhs_bv, rhs_bv, false));
+                s.add(may_unsigned_overflow(lhs_iv - rhs_iv, op->getType()->getIntegerBitWidth()));
             } else {
                 add_signed_cons();
-                s.add(z3::bvsub_no_underflow(lhs_bv, rhs_bv, true));
-                s.add(z3::bvsub_no_overflow(lhs_bv, rhs_bv));
+                s.add(may_signed_overflow(lhs_iv - rhs_iv, op->getType()->getIntegerBitWidth()));
             }
 
             check(interr::OVERFLOW);
@@ -1069,11 +1072,10 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 if (!is_nsw && !is_nuw)
                     MKINT_WARN() << "Strange ... This inst is neither nsw/nuw: " << *op;
                 add_unsigned_cons();
-                s.add(z3::bvmul_no_overflow(lhs_bv, rhs_bv, false));
+                s.add(may_unsigned_overflow(lhs_iv * rhs_iv, op->getType()->getIntegerBitWidth()));
             } else {
                 add_signed_cons();
-                s.add(z3::bvmul_no_overflow(lhs_bv, rhs_bv, true));
-                s.add(z3::bvmul_no_underflow(lhs_bv, rhs_bv)); // INTMAX * -1
+                s.add(may_signed_overflow(lhs_iv * rhs_iv, op->getType()->getIntegerBitWidth()));
             }
 
             check(interr::OVERFLOW);
@@ -1081,25 +1083,25 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         case Instruction::URem:
         case Instruction::UDiv:
             add_unsigned_cons();
-            s.add(rhs_bv != 0);
+            s.add(rhs_iv == 0);
             check(interr::DIV_BY_ZERO);
             break;
         case Instruction::SRem:
         case Instruction::SDiv: // can be overflow or divisor == 0
             add_signed_cons();
             s.push();
-            s.add(rhs_bv != 0);
+            s.add(rhs_iv == 0); // may 0?
             check(interr::DIV_BY_ZERO);
             s.pop();
-            s.add(z3::bvsdiv_no_overflow(lhs_bv, rhs_bv));
+            s.add(may_signed_overflow(lhs_iv / rhs_iv, op->getType()->getIntegerBitWidth()));
             check(interr::OVERFLOW);
             break;
         case Instruction::Shl:
         case Instruction::LShr:
         case Instruction::AShr:
-            s.add(rhs_bv <= ctx.bv_val(rhs.getUnsignedMax().getZExtValue(), rhs.getBitWidth()));
-            s.add(rhs_bv >= ctx.bv_val(rhs.getUnsignedMin().getZExtValue(), rhs.getBitWidth()));
-            s.add(rhs_bv >= ctx.bv_val(rhs.getBitWidth(), rhs.getBitWidth()));
+            s.add(rhs_iv <= ctx.int_val(rhs.getUnsignedMax().getZExtValue()));
+            s.add(rhs_iv >= ctx.int_val(rhs.getUnsignedMin().getZExtValue()));
+            s.add(rhs_iv >= ctx.int_val(rhs.getBitWidth())); // sat means bug
             check(interr::BAD_SHIFT);
             break;
         case Instruction::And:
@@ -1121,6 +1123,18 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
         for (auto gep : m_gep_oob) {
             mark_err<interr::ARRAY_OOB>(gep);
+        }
+
+        for (auto inst : m_overflow_insts) {
+            mark_err<interr::OVERFLOW>(inst);
+        }
+
+        for (auto inst : m_bad_shift_insts) {
+            mark_err<interr::BAD_SHIFT>(inst);
+        }
+
+        for (auto inst : m_div_zero_insts) {
+            mark_err<interr::DIV_BY_ZERO>(inst);
         }
     }
 

@@ -25,14 +25,15 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=1
   - [x] Casting (if have time);
 - [x] Cross-function range analysis;
 - [x] Constraint solving;
+- [x] Error type marking;
 
 ## Bound checking
 
 Consider the following cases for all integer expressions.
 
-- [ ] **overflow**: observe if *expr > MAXLIM or expr < MINLIM*;
-- [ ] **div-by-zero**: observe if *div(x, y) that y == 0*;
-- [ ] **shift**: observe if *shift(a, b) that b >= nbits*;
+- [x] **overflow**: observe if *expr > MAXLIM or expr < MINLIM*;
+- [x] **div-by-zero**: observe if *div(x, y) that y == 0*;
+- [x] **shift**: observe if *shift(a, b) that b >= nbits*;
 - [x] **array index**: observe if *arr\[idx\] that idx < 0*;
 - [x] **impossible branch**: e.g., ask a uint to be smaller than 0;
 
