@@ -355,6 +355,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                             if (cur_rng[lhs].isEmptySet() || cur_rng[rhs].isEmptySet()) {
                                 // TODO: higher precision.
                                 m_impossible_branches[cmp] = is_true_br;
+                                continue;
                             }
 
                             narrowed_insts.insert(lhs);
@@ -954,14 +955,18 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             }
         }
 
-        MKINT_LOG() << "============ Impossible Branches ============";
+        if (!m_impossible_branches.empty())
+            MKINT_LOG() << "============" << rang::fg::yellow << rang::style::bold << " Impossible Branches "
+                        << rang::style::reset << "============";
         for (auto [cmp, is_tbr] : m_impossible_branches) {
             MKINT_WARN() << rang::bg::black << rang::fg::red << cmp->getFunction()->getName() << "::" << *cmp
                          << rang::style::reset << "'s " << rang::fg::red << rang::style::italic
                          << (is_tbr ? "true" : "false") << rang::style::reset << " branch";
         }
 
-        MKINT_LOG() << "============ Array Index Out of Bound ============";
+        if (!m_gep_oob.empty())
+            MKINT_LOG() << "============" << rang::fg::yellow << rang::style::bold << " Array Index Out of Bound "
+                        << rang::style::reset << "============";
         for (auto gep : m_gep_oob) {
             MKINT_WARN() << rang::bg::black << rang::fg::red << gep->getFunction()->getName() << "::" << *gep
                          << rang::style::reset;
@@ -993,17 +998,17 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }();
 
         const auto add_signed_cons = [&] {
-            s.add(lhs_iv <= ctx.int_val(lhs.getSignedMax().getSExtValue()), "lhs_signed_max");
-            s.add(lhs_iv >= ctx.int_val(lhs.getSignedMin().getSExtValue()), "lhs_signed_min");
-            s.add(rhs_iv <= ctx.int_val(rhs.getSignedMax().getSExtValue()), "rhs_signed_max");
-            s.add(rhs_iv >= ctx.int_val(rhs.getSignedMin().getSExtValue()), "rhs_signed_min");
+            s.add(lhs_iv <= ctx.int_val(lhs.getSignedMax().getSExtValue()));
+            s.add(lhs_iv >= ctx.int_val(lhs.getSignedMin().getSExtValue()));
+            s.add(rhs_iv <= ctx.int_val(rhs.getSignedMax().getSExtValue()));
+            s.add(rhs_iv >= ctx.int_val(rhs.getSignedMin().getSExtValue()));
         };
 
         const auto add_unsigned_cons = [&] {
-            s.add(lhs_iv <= ctx.int_val(lhs.getUnsignedMax().getZExtValue()), "lhs_unsigned_max");
-            s.add(lhs_iv >= ctx.int_val(lhs.getUnsignedMin().getZExtValue()), "lhs_unsigned_min");
-            s.add(rhs_iv <= ctx.int_val(rhs.getUnsignedMax().getZExtValue()), "rhs_unsigned_max");
-            s.add(rhs_iv >= ctx.int_val(rhs.getUnsignedMin().getZExtValue()), "rhs_unsigned_min");
+            s.add(lhs_iv <= ctx.int_val(lhs.getUnsignedMax().getZExtValue()));
+            s.add(lhs_iv >= ctx.int_val(lhs.getUnsignedMin().getZExtValue()));
+            s.add(rhs_iv <= ctx.int_val(rhs.getUnsignedMax().getZExtValue()));
+            s.add(rhs_iv >= ctx.int_val(rhs.getUnsignedMin().getZExtValue()));
         };
 
         const auto may_signed_overflow = [&](z3::expr result, size_t nbit) {
@@ -1021,9 +1026,11 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         const auto check = [&](interr et) {
             if (s.check() == z3::sat) { // counter example
                 z3::model m = s.get_model();
-                MKINT_WARN() << mkstr(et) << " at " << *op;
-                MKINT_WARN() << op->getOpcodeName() << '(' << m.eval(lhs_iv, true) << ", " << m.eval(rhs_iv, true)
-                             << ')';
+                MKINT_WARN() << rang::fg::yellow << rang::style::bold << mkstr(et) << rang::style::reset << " at "
+                             << rang::bg::black << rang::fg::red << op->getParent()->getParent()->getName()
+                             << "::" << *op << rang::style::reset;
+                MKINT_WARN() << "Counter example: " << rang::bg::black << rang::fg::red << op->getOpcodeName() << '('
+                             << m.eval(lhs_iv, true) << ", " << m.eval(rhs_iv, true) << ')' << rang::style::reset;
                 switch (et) {
                 case interr::OVERFLOW:
                     m_overflow_insts.insert(op);
@@ -1043,8 +1050,6 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         switch (op->getOpcode()) {
         case Instruction::Add:
             if (!is_nsw) { // unsigned
-                if (!is_nsw && !is_nuw)
-                    MKINT_WARN() << "Strange ... This inst is neither nsw/nuw: " << *op;
                 add_unsigned_cons();
                 s.add(may_unsigned_overflow(lhs_iv + rhs_iv, op->getType()->getIntegerBitWidth()));
             } else {
@@ -1056,8 +1061,6 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             break;
         case Instruction::Sub:
             if (!is_nsw) {
-                if (!is_nsw && !is_nuw)
-                    MKINT_WARN() << "Strange ... This inst is neither nsw/nuw: " << *op;
                 add_unsigned_cons();
                 s.add(may_unsigned_overflow(lhs_iv - rhs_iv, op->getType()->getIntegerBitWidth()));
             } else {
@@ -1069,8 +1072,6 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             break;
         case Instruction::Mul:
             if (!is_nsw) {
-                if (!is_nsw && !is_nuw)
-                    MKINT_WARN() << "Strange ... This inst is neither nsw/nuw: " << *op;
                 add_unsigned_cons();
                 s.add(may_unsigned_overflow(lhs_iv * rhs_iv, op->getType()->getIntegerBitWidth()));
             } else {
