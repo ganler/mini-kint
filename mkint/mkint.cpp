@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cxxabi.h>
 
+#include <llvm-14/llvm/IR/Operator.h>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/SetVector.h>
@@ -937,7 +938,147 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
     // for general: check overflow;
     // for shl:     check shift amount;
     // for div:     check divisor != 0;
-    void binary_check(const BinaryOperator*, const crange& lhs, const crange& rhs) { }
+    void binary_check(BinaryOperator* op, const crange& lhs, const crange& rhs)
+    {
+        if (lhs.isEmptySet() || rhs.isEmptySet()) {
+            MKINT_LOG() << "Skip if there's empty set.";
+            return;
+        }
+
+        z3::context ctx;
+        z3::solver s(ctx);
+
+        // create a bit vector variable
+        z3::expr lhs_bv = ctx.bv_val("lhs", lhs.getBitWidth());
+        z3::expr rhs_bv = ctx.bv_val("rhs", rhs.getBitWidth());
+
+        const auto [is_nsw, is_nuw] = [op] {
+            if (const auto ofop = dyn_cast<OverflowingBinaryOperator>(op)) {
+                return std::make_pair(ofop->hasNoSignedWrap(), ofop->hasNoUnsignedWrap());
+            }
+            return std::make_pair(false, false);
+        }();
+
+        const auto add_signed_cons = [&] {
+            s.add(lhs_bv <= ctx.bv_val(lhs.getSignedMax().getSExtValue(), lhs.getBitWidth()));
+            s.add(lhs_bv >= ctx.bv_val(lhs.getSignedMin().getSExtValue(), lhs.getBitWidth()));
+            s.add(rhs_bv <= ctx.bv_val(rhs.getSignedMax().getSExtValue(), rhs.getBitWidth()));
+            s.add(rhs_bv >= ctx.bv_val(rhs.getSignedMin().getSExtValue(), rhs.getBitWidth()));
+        };
+
+        const auto add_unsigned_cons = [&] {
+            s.add(lhs_bv <= ctx.bv_val(lhs.getUnsignedMax().getZExtValue(), lhs.getBitWidth()));
+            s.add(lhs_bv >= ctx.bv_val(lhs.getUnsignedMin().getZExtValue(), lhs.getBitWidth()));
+            s.add(rhs_bv <= ctx.bv_val(rhs.getUnsignedMax().getZExtValue(), rhs.getBitWidth()));
+            s.add(rhs_bv >= ctx.bv_val(rhs.getUnsignedMin().getZExtValue(), rhs.getBitWidth()));
+        };
+
+        switch (op->getOpcode()) {
+        case Instruction::Add:
+            if (is_nuw) {
+                add_unsigned_cons();
+                s.add(!z3::bvadd_no_overflow(lhs_bv, rhs_bv, false));
+            }
+            if (is_nsw) {
+                add_signed_cons();
+                s.add(!z3::bvadd_no_overflow(lhs_bv, rhs_bv, true));
+                s.add(!z3::bvadd_no_underflow(lhs_bv, rhs_bv));
+            }
+
+            if (s.check() == z3::sat) {
+                z3::model m = s.get_model();
+                MKINT_WARN() << "Overflow at " << *op;
+                MKINT_WARN() << op->getName() << m.eval(rhs_bv, true) << ", " << m.eval(rhs_bv, true);
+                m_overflow_insts.insert(op);
+            }
+            break;
+        case Instruction::Sub:
+            if (is_nuw) {
+                add_unsigned_cons();
+                s.add(!z3::bvsub_no_underflow(lhs_bv, rhs_bv, false));
+            }
+            if (is_nsw) {
+                add_signed_cons();
+                s.add(!z3::bvsub_no_underflow(lhs_bv, rhs_bv, true));
+                s.add(!z3::bvsub_no_overflow(lhs_bv, rhs_bv));
+            }
+
+            if (s.check() == z3::sat) {
+                z3::model m = s.get_model();
+                MKINT_WARN() << "Overflow at " << *op;
+                MKINT_WARN() << op->getName() << m.eval(rhs_bv, true) << ", " << m.eval(rhs_bv, true);
+                m_overflow_insts.insert(op);
+            }
+            break;
+        case Instruction::Mul:
+            if (is_nuw) {
+                add_unsigned_cons();
+                s.add(!z3::bvmul_no_overflow(lhs_bv, rhs_bv, false));
+            }
+            if (is_nsw) {
+                add_signed_cons();
+                s.add(!z3::bvmul_no_overflow(lhs_bv, rhs_bv, true));
+                s.add(!z3::bvmul_no_underflow(lhs_bv, rhs_bv)); // INTMAX * -1
+            }
+
+            if (s.check() == z3::sat) {
+                z3::model m = s.get_model();
+                MKINT_WARN() << "Overflow at " << *op;
+                MKINT_WARN() << op->getName() << m.eval(rhs_bv, true) << ", " << m.eval(rhs_bv, true);
+                m_overflow_insts.insert(op);
+            }
+            break;
+        case Instruction::URem:
+        case Instruction::UDiv:
+            add_unsigned_cons();
+            s.add(rhs_bv != 0);
+            if (s.check() == z3::sat) {
+                z3::model m = s.get_model();
+                MKINT_WARN() << "Division by zero at " << *op;
+                MKINT_WARN() << op->getName() << m.eval(rhs_bv, true) << ", " << m.eval(rhs_bv, true);
+                m_div_zero_insts.insert(op);
+            }
+            break;
+        case Instruction::SRem:
+        case Instruction::SDiv: // can be overflow or divisor == 0
+            add_signed_cons();
+            s.push();
+            s.add(rhs_bv != 0);
+            if (s.check() == z3::sat) {
+                z3::model m = s.get_model();
+                MKINT_WARN() << "Division by zero at " << *op;
+                MKINT_WARN() << op->getName() << m.eval(rhs_bv, true) << ", " << m.eval(rhs_bv, true);
+                m_div_zero_insts.insert(op);
+            }
+            s.pop();
+            s.add(!z3::bvsdiv_no_overflow(lhs_bv, rhs_bv));
+            if (s.check() == z3::sat) {
+                z3::model m = s.get_model();
+                MKINT_WARN() << "Overflow at " << *op;
+                MKINT_WARN() << op->getName() << m.eval(rhs_bv, true) << ", " << m.eval(rhs_bv, true);
+                m_overflow_insts.insert(op);
+            }
+            break;
+        case Instruction::Shl:
+        case Instruction::LShr:
+        case Instruction::AShr:
+            s.add(rhs_bv <= ctx.bv_val(rhs.getUnsignedMax().getZExtValue(), rhs.getBitWidth()));
+            s.add(rhs_bv >= ctx.bv_val(rhs.getUnsignedMin().getZExtValue(), rhs.getBitWidth()));
+            s.add(rhs_bv >= ctx.bv_val(rhs.getBitWidth(), rhs.getBitWidth()));
+            if (s.check() == z3::sat) {
+                z3::model m = s.get_model();
+                MKINT_WARN() << "Shift amount is out of bound at " << *op;
+                MKINT_WARN() << op->getName() << m.eval(rhs_bv, true) << ", " << m.eval(rhs_bv, true);
+                m_bad_shift_insts.insert(op);
+            }
+            break;
+        case Instruction::And:
+        case Instruction::Or:
+        case Instruction::Xor:
+        default:
+            break;
+        }
+    }
 
     void mark_errors()
     {

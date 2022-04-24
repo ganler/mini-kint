@@ -24,7 +24,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=1
   - [x] Unary operator;
   - [x] Casting (if have time);
 - [x] Cross-function range analysis;
-- [ ] Constraint collection;
+- [x] Constraint solving;
 
 ## Bound checking
 
