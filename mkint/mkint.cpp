@@ -847,16 +847,19 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             // Functions for range analysis:
             // 1. taint source -> taint sink.
             // 2. integer functions.
+            MKINT_LOG() << "Init Range Analysis: " << F.getName();
             if (F.getReturnType()->isIntegerTy() || m_taint_funcs.contains(&F)) {
                 if (F.isDeclaration()) {
                     if (is_taint_src_arg_call(F.getName()) && !m_taint_funcs.contains(&F) // will not call sink fns.
                         && m_callback_tsrc_fn.contains(
                             F.getName().substr(0, F.getName().size() - StringRef(MKINT_TAINT_SRC_SUFFX).size() - 1))) {
-                        m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), false);
+                        if (F.getReturnType()->isIntegerTy())
+                            m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), false);
                         MKINT_LOG() << "Skip range analysis for func w/o impl [Empty Set]: " << F.getName()
                                     << "\tin taint_funcs? ";
                     } else {
-                        m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), true); // full.
+                        if (F.getReturnType()->isIntegerTy())
+                            m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), true); // full.
                         MKINT_LOG() << "Skip range analysis for func w/o impl [Full Set]: " << F.getName();
                     }
                 } else {
