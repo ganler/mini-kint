@@ -2,10 +2,8 @@
 #include "rang.hpp"
 #include "smt.hpp"
 
-#include <cstddef>
 #include <cxxabi.h>
 
-#include <llvm-14/llvm/IR/Operator.h>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/SetVector.h>
@@ -22,6 +20,7 @@
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Metadata.h>
+#include <llvm/IR/Operator.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Value.h>
 #include <llvm/Passes/PassBuilder.h>
@@ -34,6 +33,7 @@
 
 #include <array>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -120,6 +120,27 @@ template <interr err, typename StrRet = const char*> constexpr StrRet mkstr()
         static_assert(err == interr::OVERFLOW || err == interr::DIV_BY_ZERO || err == interr::BAD_SHIFT
                 || err == interr::ARRAY_OOB || err == interr::DEAD_TRUE_BR || err == interr::DEAD_FALSE_BR,
             "unknown error type");
+        return ""; // statically impossible
+    }
+}
+
+std::string_view mkstr(interr err)
+{
+    switch (err) {
+    case interr::OVERFLOW:
+        return mkstr<interr::OVERFLOW>();
+    case interr::DIV_BY_ZERO:
+        return mkstr<interr::DIV_BY_ZERO>();
+    case interr::BAD_SHIFT:
+        return mkstr<interr::BAD_SHIFT>();
+    case interr::ARRAY_OOB:
+        return mkstr<interr::ARRAY_OOB>();
+    case interr::DEAD_TRUE_BR:
+        return mkstr<interr::DEAD_TRUE_BR>();
+    case interr::DEAD_FALSE_BR:
+        return mkstr<interr::DEAD_FALSE_BR>();
+    default:
+        assert(false && "unknown error type");
         return ""; // statically impossible
     }
 }
@@ -249,6 +270,21 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }
     }
 
+    crange get_range_by_bb(const Value* var, const BasicBlock* bb)
+    {
+        auto& bb_range = m_func2range_info[bb->getParent()];
+        if (auto lconst = dyn_cast<ConstantInt>(var)) {
+            return crange(lconst->getValue());
+        } else {
+            if (bb_range[bb].count(var) == 0) {
+                if (auto gv = dyn_cast<GlobalVariable>(var))
+                    return m_global2range[gv];
+                MKINT_CHECK_ABORT(false) << "Unknown operand type: " << *var;
+            }
+            return bb_range[bb][var];
+        }
+    }
+
     void range_analysis(Function& F)
     {
         MKINT_LOG() << "Range Analysis -> " << F.getName();
@@ -259,20 +295,6 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             auto bb = &bbref;
 
             auto& cur_rng = bb_range[bb];
-
-            const auto get_range_by_bb = [this, &bb_range](auto var, const BasicBlock* bb) -> crange {
-                if (auto lconst = dyn_cast<ConstantInt>(var)) {
-                    return crange(lconst->getValue());
-                } else {
-                    if (bb_range[bb].count(var) == 0) {
-                        if (auto gv = dyn_cast<GlobalVariable>(var))
-                            return m_global2range[gv];
-                        MKINT_CHECK_ABORT(false) << "Unknown operand type: " << *var;
-                    }
-                    return bb_range[bb][var];
-                }
-            };
-
             // merge all incoming bbs
             for (const auto& pred : predecessors(bb)) {
                 // avoid backedge: pred can't be a successor of bb.
@@ -398,7 +420,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             }
 
             for (auto& inst : bb->getInstList()) {
-                const auto get_rng = [&bb, get_range_by_bb](auto var) { return get_range_by_bb(var, bb); };
+                const auto get_rng = [&bb, this](auto var) { return get_range_by_bb(var, bb); };
                 // Store / Call / Return
                 if (const auto call = dyn_cast<CallInst>(&inst)) {
                     if (const auto f = call->getCalledFunction()) {
@@ -802,6 +824,18 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }
         this->pring_all_ranges();
 
+        for (auto& F : m_taint_funcs) {
+            for (auto& bb : F->getBasicBlockList()) {
+                for (auto& inst : bb) {
+                    if (auto bop = dyn_cast<BinaryOperator>(&inst)) {
+                        auto lhs = get_range_by_bb(bop->getOperand(0), &bb);
+                        auto rhs = get_range_by_bb(bop->getOperand(1), &bb);
+                        binary_check(bop, lhs, rhs);
+                    }
+                }
+            }
+        }
+
         this->mark_errors();
 
         return PreservedAnalyses::all();
@@ -941,7 +975,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
     void binary_check(BinaryOperator* op, const crange& lhs, const crange& rhs)
     {
         if (lhs.isEmptySet() || rhs.isEmptySet()) {
-            MKINT_LOG() << "Skip if there's empty set.";
+            MKINT_LOG() << "Skip due empty range in operands: " << *op;
             return;
         }
 
@@ -949,8 +983,8 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         z3::solver s(ctx);
 
         // create a bit vector variable
-        z3::expr lhs_bv = ctx.bv_val("lhs", lhs.getBitWidth());
-        z3::expr rhs_bv = ctx.bv_val("rhs", rhs.getBitWidth());
+        z3::expr lhs_bv = ctx.bv_const("lhs", lhs.getBitWidth());
+        z3::expr rhs_bv = ctx.bv_const("rhs", rhs.getBitWidth());
 
         const auto [is_nsw, is_nuw] = [op] {
             if (const auto ofop = dyn_cast<OverflowingBinaryOperator>(op)) {
@@ -960,104 +994,105 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }();
 
         const auto add_signed_cons = [&] {
-            s.add(lhs_bv <= ctx.bv_val(lhs.getSignedMax().getSExtValue(), lhs.getBitWidth()));
-            s.add(lhs_bv >= ctx.bv_val(lhs.getSignedMin().getSExtValue(), lhs.getBitWidth()));
-            s.add(rhs_bv <= ctx.bv_val(rhs.getSignedMax().getSExtValue(), rhs.getBitWidth()));
-            s.add(rhs_bv >= ctx.bv_val(rhs.getSignedMin().getSExtValue(), rhs.getBitWidth()));
+            s.add(lhs_bv <= ctx.bv_val(lhs.getSignedMax().getSExtValue(), lhs.getBitWidth()), "lhs_signed_max");
+            s.add(lhs_bv >= ctx.bv_val(lhs.getSignedMin().getSExtValue(), lhs.getBitWidth()), "lhs_signed_min");
+            s.add(rhs_bv <= ctx.bv_val(rhs.getSignedMax().getSExtValue(), rhs.getBitWidth()), "rhs_signed_max");
+            s.add(rhs_bv >= ctx.bv_val(rhs.getSignedMin().getSExtValue(), rhs.getBitWidth()), "rhs_signed_min");
+            MKINT_WARN() << "lhs range: " << lhs << " rhs range: " << rhs;
+            // MKINT_LOG() << s.assertions();
         };
 
         const auto add_unsigned_cons = [&] {
-            s.add(lhs_bv <= ctx.bv_val(lhs.getUnsignedMax().getZExtValue(), lhs.getBitWidth()));
-            s.add(lhs_bv >= ctx.bv_val(lhs.getUnsignedMin().getZExtValue(), lhs.getBitWidth()));
-            s.add(rhs_bv <= ctx.bv_val(rhs.getUnsignedMax().getZExtValue(), rhs.getBitWidth()));
-            s.add(rhs_bv >= ctx.bv_val(rhs.getUnsignedMin().getZExtValue(), rhs.getBitWidth()));
+            s.add(lhs_bv <= ctx.bv_val(lhs.getUnsignedMax().getZExtValue(), lhs.getBitWidth()), "lhs_unsigned_max");
+            s.add(lhs_bv >= ctx.bv_val(lhs.getUnsignedMin().getZExtValue(), lhs.getBitWidth()), "lhs_unsigned_min");
+            s.add(rhs_bv <= ctx.bv_val(rhs.getUnsignedMax().getZExtValue(), rhs.getBitWidth()), "rhs_unsigned_max");
+            s.add(rhs_bv >= ctx.bv_val(rhs.getUnsignedMin().getZExtValue(), rhs.getBitWidth()), "rhs_unsigned_min");
+            MKINT_WARN() << "lhs range: " << lhs << " rhs range: " << rhs;
+            // MKINT_LOG() << s.assertions();
+        };
+
+        const auto check = [&](interr et) {
+            MKINT_LOG() << s.assertions();
+            if (s.check() == z3::unsat) { // counter example
+                MKINT_WARN() << s.unsat_core();
+                z3::model m = s.get_model();
+                MKINT_WARN() << mkstr(et) << " at " << *op;
+                MKINT_WARN() << op->getOpcodeName() << '(' << m.eval(rhs_bv, true) << ", " << m.eval(rhs_bv, true)
+                             << ')';
+                switch (et) {
+                case interr::OVERFLOW:
+                    m_overflow_insts.insert(op);
+                    break;
+                case interr::BAD_SHIFT:
+                    m_bad_shift_insts.insert(op);
+                    break;
+                case interr::DIV_BY_ZERO:
+                    m_div_zero_insts.insert(op);
+                    break;
+                default:
+                    break;
+                }
+            }
         };
 
         switch (op->getOpcode()) {
         case Instruction::Add:
-            if (is_nuw) {
+            if (!is_nsw) {
+                if (!is_nsw && !is_nuw)
+                    MKINT_WARN() << "Strange ... This inst is neither nsw/nuw: " << *op;
                 add_unsigned_cons();
-                s.add(!z3::bvadd_no_overflow(lhs_bv, rhs_bv, false));
-            }
-            if (is_nsw) {
+                s.add(z3::bvadd_no_overflow(lhs_bv, rhs_bv, false));
+            } else {
                 add_signed_cons();
-                s.add(!z3::bvadd_no_overflow(lhs_bv, rhs_bv, true));
-                s.add(!z3::bvadd_no_underflow(lhs_bv, rhs_bv));
+                s.add(z3::bvadd_no_overflow(lhs_bv, rhs_bv, true));
+                s.add(z3::bvadd_no_underflow(lhs_bv, rhs_bv));
             }
 
-            if (s.check() == z3::sat) {
-                z3::model m = s.get_model();
-                MKINT_WARN() << "Overflow at " << *op;
-                MKINT_WARN() << op->getName() << m.eval(rhs_bv, true) << ", " << m.eval(rhs_bv, true);
-                m_overflow_insts.insert(op);
-            }
+            check(interr::OVERFLOW);
             break;
         case Instruction::Sub:
-            if (is_nuw) {
+            if (!is_nsw) {
+                if (!is_nsw && !is_nuw)
+                    MKINT_WARN() << "Strange ... This inst is neither nsw/nuw: " << *op;
                 add_unsigned_cons();
-                s.add(!z3::bvsub_no_underflow(lhs_bv, rhs_bv, false));
-            }
-            if (is_nsw) {
+                s.add(z3::bvsub_no_underflow(lhs_bv, rhs_bv, false));
+            } else {
                 add_signed_cons();
-                s.add(!z3::bvsub_no_underflow(lhs_bv, rhs_bv, true));
-                s.add(!z3::bvsub_no_overflow(lhs_bv, rhs_bv));
+                s.add(z3::bvsub_no_underflow(lhs_bv, rhs_bv, true));
+                s.add(z3::bvsub_no_overflow(lhs_bv, rhs_bv));
             }
 
-            if (s.check() == z3::sat) {
-                z3::model m = s.get_model();
-                MKINT_WARN() << "Overflow at " << *op;
-                MKINT_WARN() << op->getName() << m.eval(rhs_bv, true) << ", " << m.eval(rhs_bv, true);
-                m_overflow_insts.insert(op);
-            }
+            check(interr::OVERFLOW);
             break;
         case Instruction::Mul:
-            if (is_nuw) {
+            if (!is_nsw) {
+                if (!is_nsw && !is_nuw)
+                    MKINT_WARN() << "Strange ... This inst is neither nsw/nuw: " << *op;
                 add_unsigned_cons();
-                s.add(!z3::bvmul_no_overflow(lhs_bv, rhs_bv, false));
-            }
-            if (is_nsw) {
+                s.add(z3::bvmul_no_overflow(lhs_bv, rhs_bv, false));
+            } else {
                 add_signed_cons();
-                s.add(!z3::bvmul_no_overflow(lhs_bv, rhs_bv, true));
-                s.add(!z3::bvmul_no_underflow(lhs_bv, rhs_bv)); // INTMAX * -1
+                s.add(z3::bvmul_no_overflow(lhs_bv, rhs_bv, true));
+                s.add(z3::bvmul_no_underflow(lhs_bv, rhs_bv)); // INTMAX * -1
             }
 
-            if (s.check() == z3::sat) {
-                z3::model m = s.get_model();
-                MKINT_WARN() << "Overflow at " << *op;
-                MKINT_WARN() << op->getName() << m.eval(rhs_bv, true) << ", " << m.eval(rhs_bv, true);
-                m_overflow_insts.insert(op);
-            }
+            check(interr::OVERFLOW);
             break;
         case Instruction::URem:
         case Instruction::UDiv:
             add_unsigned_cons();
             s.add(rhs_bv != 0);
-            if (s.check() == z3::sat) {
-                z3::model m = s.get_model();
-                MKINT_WARN() << "Division by zero at " << *op;
-                MKINT_WARN() << op->getName() << m.eval(rhs_bv, true) << ", " << m.eval(rhs_bv, true);
-                m_div_zero_insts.insert(op);
-            }
+            check(interr::DIV_BY_ZERO);
             break;
         case Instruction::SRem:
         case Instruction::SDiv: // can be overflow or divisor == 0
             add_signed_cons();
             s.push();
             s.add(rhs_bv != 0);
-            if (s.check() == z3::sat) {
-                z3::model m = s.get_model();
-                MKINT_WARN() << "Division by zero at " << *op;
-                MKINT_WARN() << op->getName() << m.eval(rhs_bv, true) << ", " << m.eval(rhs_bv, true);
-                m_div_zero_insts.insert(op);
-            }
+            check(interr::DIV_BY_ZERO);
             s.pop();
-            s.add(!z3::bvsdiv_no_overflow(lhs_bv, rhs_bv));
-            if (s.check() == z3::sat) {
-                z3::model m = s.get_model();
-                MKINT_WARN() << "Overflow at " << *op;
-                MKINT_WARN() << op->getName() << m.eval(rhs_bv, true) << ", " << m.eval(rhs_bv, true);
-                m_overflow_insts.insert(op);
-            }
+            s.add(z3::bvsdiv_no_overflow(lhs_bv, rhs_bv));
+            check(interr::OVERFLOW);
             break;
         case Instruction::Shl:
         case Instruction::LShr:
@@ -1065,12 +1100,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             s.add(rhs_bv <= ctx.bv_val(rhs.getUnsignedMax().getZExtValue(), rhs.getBitWidth()));
             s.add(rhs_bv >= ctx.bv_val(rhs.getUnsignedMin().getZExtValue(), rhs.getBitWidth()));
             s.add(rhs_bv >= ctx.bv_val(rhs.getBitWidth(), rhs.getBitWidth()));
-            if (s.check() == z3::sat) {
-                z3::model m = s.get_model();
-                MKINT_WARN() << "Shift amount is out of bound at " << *op;
-                MKINT_WARN() << op->getName() << m.eval(rhs_bv, true) << ", " << m.eval(rhs_bv, true);
-                m_bad_shift_insts.insert(op);
-            }
+            check(interr::BAD_SHIFT);
             break;
         case Instruction::And:
         case Instruction::Or:
