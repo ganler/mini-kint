@@ -607,7 +607,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             return false;
         } else if (inst->getMetadata(MKINT_IR_SINK)) {
             for (auto f : get_sink_fns(inst)) {
-                m_taint_funcs.insert(f);
+                m_taint_funcs.insert(f); // sink are tainted.
             }
             return true;
         }
@@ -849,11 +849,12 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             // 2. integer functions.
             if (F.getReturnType()->isIntegerTy() || m_taint_funcs.contains(&F)) {
                 if (F.isDeclaration()) {
-                    if (is_taint_src_arg_call(F.getName())
+                    if (is_taint_src_arg_call(F.getName()) && !m_taint_funcs.contains(&F) // will not call sink fns.
                         && m_callback_tsrc_fn.contains(
                             F.getName().substr(0, F.getName().size() - StringRef(MKINT_TAINT_SRC_SUFFX).size() - 1))) {
                         m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), false);
-                        MKINT_LOG() << "Skip range analysis for func w/o impl [Empty Set]: " << F.getName();
+                        MKINT_LOG() << "Skip range analysis for func w/o impl [Empty Set]: " << F.getName()
+                                    << "\tin taint_funcs? ";
                     } else {
                         m_func2ret_range[&F] = crange(F.getReturnType()->getIntegerBitWidth(), true); // full.
                         MKINT_LOG() << "Skip range analysis for func w/o impl [Full Set]: " << F.getName();
@@ -877,6 +878,40 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                         }
                     }
                     m_range_analysis_funcs.insert(&F);
+                }
+            }
+        }
+
+        // m_callback_tsrc_fn's highest user's input is set as full set.
+        for (auto& fn : m_callback_tsrc_fn) {
+            auto cbf = M.getFunction(fn);
+
+            std::deque<Function*> worklist;
+            SetVector<Function*> hist;
+
+            worklist.push_back(cbf);
+            hist.insert(cbf);
+
+            while (!worklist.empty()) {
+                auto cur = worklist.front();
+                worklist.pop_front();
+
+                if (cur->user_empty()) {
+                    for (const auto& arg : cur->args()) {
+                        m_func2range_info[cur][&(cur->getEntryBlock())][&arg]
+                            = crange(arg.getType()->getIntegerBitWidth(), true);
+                        ;
+                    }
+                } else {
+                    for (const auto& u : cur->users()) {
+                        if (auto uu = dyn_cast<CallInst>(u)) {
+                            auto caller = uu->getCalledFunction();
+                            if (!hist.contains(caller)) {
+                                worklist.push_back(caller);
+                                hist.insert(caller);
+                            }
+                        }
+                    }
                 }
             }
         }
