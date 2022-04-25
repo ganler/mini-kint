@@ -65,7 +65,7 @@ template <typename V, typename... Vs> static constexpr std::array<V, sizeof...(V
 
 constexpr auto MKINT_SINKS = mkarray<std::pair<const char*, size_t>>(std::pair { "malloc", 0 },
     std::pair { "__mkint_sink0", 0 }, std::pair { "__mkint_sink1", 1 }, std::pair { "xmalloc", 0 },
-    std::pair { "kmalloc", 0 }, std::pair { "kzalloc", 0 }, std::pair { "vmalloc", 0 }, std::pair { "mem_alloc", 0});
+    std::pair { "kmalloc", 0 }, std::pair { "kzalloc", 0 }, std::pair { "vmalloc", 0 }, std::pair { "mem_alloc", 0 });
 
 struct crange : public ConstantRange {
     /// https://llvm.org/doxygen/classllvm_1_1ConstantRange.html
@@ -94,6 +94,16 @@ struct crange : public ConstantRange {
         // return ConstantRange::makeSatisfyingICmpRegion;
     }
 };
+
+int64_t get_id(Instruction* inst)
+{
+    std::string str;
+    llvm::raw_string_ostream rso(str);
+    inst->print(rso);
+    auto inst_str = StringRef(rso.str());
+    auto ids = inst_str.trim().split(' ').first.substr(1);
+    return std::stoi(ids.str());
+}
 
 namespace {
 
@@ -301,8 +311,6 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                     continue; // skip backedge
                 }
 
-                SetVector<const Value*> narrowed_insts;
-
                 // branch or switch
                 // NOTE: branch should be used to narrow the range.
                 if (auto terminator = pred->getTerminator(); auto br = dyn_cast<BranchInst>(terminator)) {
@@ -315,7 +323,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
                             if (!lhs->getType()->isIntegerTy() || !rhs->getType()->isIntegerTy()) {
                                 // This should be covered by `ICmpInst`.
-                                MKINT_CHECK_ABORT(false) << "The br operands are not both integers: " << *cmp;
+                                MKINT_WARN() << "The br operands are not both integers: " << *cmp;
                                 continue;
                             }
 
@@ -355,11 +363,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                             if (cur_rng[lhs].isEmptySet() || cur_rng[rhs].isEmptySet()) {
                                 // TODO: higher precision.
                                 m_impossible_branches[cmp] = is_true_br;
-                                continue;
                             }
-
-                            narrowed_insts.insert(lhs);
-                            narrowed_insts.insert(rhs);
                         }
                     }
                 } else if (auto swt = dyn_cast<SwitchInst>(terminator)) {
@@ -376,31 +380,28 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                     //                                     i32 1, label %onone
                     //                                     i32 2, label %ontwo ]
                     auto cond = swt->getCondition();
-                    if (!cond->getType()->isIntegerTy()) {
-                        continue;
-                    }
+                    if (cond->getType()->isIntegerTy()) {
+                        auto cond_rng = get_range_by_bb(cond, pred);
+                        auto emp_rng = crange::getEmpty(cond->getType()->getIntegerBitWidth());
 
-                    auto cond_rng = get_range_by_bb(cond, bb);
-                    auto emp_rng = crange::getEmpty(cond->getType()->getIntegerBitWidth());
-
-                    if (swt->getDefaultDest() == bb) { // default
-                        // not (all)
-                        for (auto c : swt->cases()) {
-                            auto case_val = c.getCaseValue();
-                            emp_rng = emp_rng.unionWith(case_val->getValue());
-                        }
-                        emp_rng = emp_rng.inverse();
-                    } else {
-                        for (auto c : swt->cases()) {
-                            if (c.getCaseSuccessor() == bb) {
+                        if (swt->getDefaultDest() == bb) { // default
+                            // not (all)
+                            for (auto c : swt->cases()) {
                                 auto case_val = c.getCaseValue();
                                 emp_rng = emp_rng.unionWith(case_val->getValue());
                             }
+                            emp_rng = emp_rng.inverse();
+                        } else {
+                            for (auto c : swt->cases()) {
+                                if (c.getCaseSuccessor() == bb) {
+                                    auto case_val = c.getCaseValue();
+                                    emp_rng = emp_rng.unionWith(case_val->getValue());
+                                }
+                            }
                         }
-                    }
 
-                    cur_rng[cond] = cond_rng.unionWith(emp_rng);
-                    narrowed_insts.insert(cond);
+                        cur_rng[cond] = cond_rng.unionWith(emp_rng);
+                    }
                 } else {
                     // try catch... (thank god, C does not have try-catch)
                     // indirectbr... ?
@@ -409,12 +410,10 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
                 for (const auto& [inst, rng] : bb_range[pred]) {
                     // TODO: Optimization: No need to track all values.
-                    if (!narrowed_insts.contains(inst)) { // for branched insts, the ranges is computed.
-                        if (auto it = cur_rng.find(inst); it == cur_rng.end()) { // not found
-                            cur_rng[inst] = rng;
-                        } else { // merge
-                            it->second = it->second.unionWith(rng);
-                        }
+                    if (auto it = cur_rng.find(inst); it == cur_rng.end()) { // not found
+                        cur_rng[inst] = rng;
+                    } else { // merge
+                        it->second = it->second.unionWith(rng);
                     }
                 }
             }
@@ -565,7 +564,8 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
                         if (!succ) {
                             MKINT_WARN() << "Unknown address to load (unknow gep src addr): " << inst;
-                            new_range = crange(op->getType()->getIntegerBitWidth()); // unknown addr -> full range.
+                            new_range
+                                = crange(op->getType()->getIntegerBitWidth(), true); // unknown addr -> full range.
                         }
                     } else {
                         MKINT_WARN() << "Unknown address to load: " << inst;
@@ -649,6 +649,12 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
             for (auto user : inst->users()) {
                 if (auto user_inst = dyn_cast<Instruction>(user)) {
+                    // if used by phi whose id is even smaller than you. -> loop
+                    if (auto phi = dyn_cast<PHINode>(user_inst)) {
+                        if (get_id(phi) < get_id(inst)) {
+                            continue;
+                        }
+                    }
                     you_see_sink |= is_sink_reachable(user_inst);
                 }
             }
@@ -722,17 +728,19 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             if (auto* call = dyn_cast<CallInst>(&inst)) {
                 // call in MKINT_SINKS
                 for (const auto& [name, idx] : MKINT_SINKS) {
-                    const auto demangled_func_name = demangle(call->getCalledFunction()->getName().str().c_str());
-                    if (demangled_func_name == name) {
-                        if (auto arg = dyn_cast_or_null<Instruction>(call->getArgOperand(idx))) {
-                            MKINT_LOG() << "Taint Analysis -> sink: argument [" << idx << "] of "
-                                        << demangled_func_name;
-                            mark_sink(*arg, name);
+                    if (auto called_fn = call->getCalledFunction()) {
+                        const auto demangled_func_name = demangle(called_fn->getName().str().c_str());
+                        if (demangled_func_name == name) {
+                            if (auto arg = dyn_cast_or_null<Instruction>(call->getArgOperand(idx))) {
+                                MKINT_LOG()
+                                    << "Taint Analysis -> sink: argument [" << idx << "] of " << demangled_func_name;
+                                mark_sink(*arg, name);
+                            }
+                            break;
+                        } else if (StringRef(demangled_func_name).startswith(name)) {
+                            MKINT_WARN() << "Are you missing the sink? [demangled_func_name]: " << demangled_func_name
+                                         << "; [name]: " << name;
                         }
-                        break;
-                    } else if (StringRef(demangled_func_name).startswith(name)) {
-                        MKINT_WARN() << "Are you missing the sink? [demangled_func_name]: " << demangled_func_name
-                                     << "; [name]: " << name;
                     }
                 }
             }
