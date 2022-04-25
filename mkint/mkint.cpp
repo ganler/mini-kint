@@ -65,7 +65,7 @@ template <typename V, typename... Vs> static constexpr std::array<V, sizeof...(V
 
 constexpr auto MKINT_SINKS = mkarray<std::pair<const char*, size_t>>(std::pair { "malloc", 0 },
     std::pair { "__mkint_sink0", 0 }, std::pair { "__mkint_sink1", 1 }, std::pair { "xmalloc", 0 },
-    std::pair { "kmalloc", 0 }, std::pair { "kzalloc", 0 }, std::pair { "vmalloc", 0 });
+    std::pair { "kmalloc", 0 }, std::pair { "kzalloc", 0 }, std::pair { "vmalloc", 0 }, std::pair { "mem_alloc", 0});
 
 struct crange : public ConstantRange {
     /// https://llvm.org/doxygen/classllvm_1_1ConstantRange.html

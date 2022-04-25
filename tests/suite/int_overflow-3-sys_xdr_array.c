@@ -1,5 +1,13 @@
 // http://www.kb.cert.org/vuls/id/192995
 
+
+// RUN: clang-14 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o %t.ll
+// RUN: opt-14 -load-pass-plugin=%builddir/mkint/MiniKintPass.so -passes=mkint-pass -S %t.ll -o %t.out.ll
+
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
+
+
 #include <assert.h>
 #include <limits.h>
 #include <stdio.h>
@@ -9,7 +17,7 @@
 #include <rpc/xdr.h>
 
 bool_t
-xdr_array(XDR *xdrs,
+sys_xdr_array(XDR *xdrs,
 	caddr_t *addrp,		/* array pointer */
 	u_int *sizep,		/* number of elements */
 	u_int maxsize,		/* max numberof elements */
