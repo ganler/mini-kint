@@ -10,7 +10,9 @@ llvm.initialize_native_target()
 llvm.initialize_native_asmprinter()  # yes, even this one
 
 ERR_NAME_MAP = {
-    "int_overflow": "integer overflow"
+    "int_overflow": "integer overflow",
+    "int_overflow_ub": "integer overflow",
+    "array_index": "array index out of bound"
 }
 
 class TestMKint(unittest.TestCase):
@@ -54,12 +56,17 @@ class TestMKint(unittest.TestCase):
             meta = re.findall("^![0-9.]+", line)
             if len(meta) == 1:
                 v = line.split(' = ')[1]
+                if '"' not in v:
+                    continue
                 v = v.split('"')[1]
                 meta_map[meta[0]] = v
 
         ERR = None
         ERR_FN = None
         m = llvm.parse_assembly(TestMKint.AFTER_IR)
+
+        print(f"+++++ m: {m}")
+
         for f in m.functions:
             # print(f'Function: {f.name}/`{f.type}`')
 
@@ -82,26 +89,18 @@ class TestMKint(unittest.TestCase):
 
                     assert i.is_instruction and not (i.is_function or i.is_block)
 
-                    err = re.findall("![a-zA-Z.]+", i.__str__())
+                    err = re.findall("!mkint.err", i.__str__())
                     if len(err) != 1:
-                        continue
-
-                    err = err[0]
-
-                    err_type = re.findall("![0-9]+", i.__str__())
-                    if len(err_type) != 1:
-                        continue
-
-                    if 'mkint.err' not in err:
                         continue
 
                     mkinterr = re.findall("!mkint.err ![0-9]+", f.__str__())[0]
                     err_type = mkinterr.split(" ")[1]
 
-                    print(f'== Instruction: {i.name}/`{i.opcode}`/`{i.type}`: `{i}`')
-                    print(f'== Error: {err}, Error type: {meta_map[err_type]}')
                     ERR_FN = f.name
                     ERR = meta_map[err_type]
+
+                    print(f'== Instruction: {i.name}/`{i.opcode}`/`{i.type}`: `{i}`')
+                    print(f'== Error: {err}, Error type: {meta_map[err_type]}, ERR_FN: {ERR_FN}')
 
                     # instruction = f'Instruction: {i.name}/`{i.opcode}`/`{i.type}`'
                     # assert instruction in err_to_find
@@ -112,8 +111,12 @@ class TestMKint(unittest.TestCase):
                     # for o in i.operands:
                     #     print(f'Operand: {o.name}/{o.type}')
 
-        assert ERR_NAME_MAP[ERR_NAME] == ERR
-        assert ERR_FN_NAME == ERR_FN
+        if ERR_FN_NAME == "none":
+            assert ERR == None
+            assert ERR_FN == None
+        else:
+            assert ERR_NAME_MAP[ERR_NAME] == ERR
+            assert ERR_FN_NAME == ERR_FN
 
 if __name__ == '__main__':
     print("Usage: BEFORE=<before.ll> AFTER=<after.ll> python3 llvm_lite.py")
