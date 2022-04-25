@@ -1,7 +1,6 @@
 // http://www.securityfocus.com/archive/1/362953
 
 #include "linux.h"
-#include <cstddef>
 
 #define sctp_sk(sk)	((struct sctp_sock *)(sk))
 
