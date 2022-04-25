@@ -45,7 +45,7 @@ class TestMKint(unittest.TestCase):
         #             if err in before_annot_map:
         #                 err_to_find[f'Instruction: {i.name}/`{i.opcode}`/`{i.type}`'] = before_annot_map[err]
 
-        names = TestMKint.AFTER_FILE.split("-")
+        names = TestMKint.AFTER_FILE.split("/")[-1].split("-")
         ERR_NAME = names[0]
         ERR_FN_NAME = names[2].split(".")[0]
 
@@ -78,7 +78,6 @@ class TestMKint(unittest.TestCase):
                 assert b.block is None
                 assert b.is_block and not (b.is_function or b.is_instruction)
                 for i in b.instructions:
-                    print(f'Instruction: {i.name}/`{i.opcode}`/`{i.type}`: `{i}`')
                     # print(f'Attributes: {list(i.attributes)}')
 
                     assert i.is_instruction and not (i.is_function or i.is_block)
@@ -99,7 +98,8 @@ class TestMKint(unittest.TestCase):
                     mkinterr = re.findall("!mkint.err ![0-9]+", f.__str__())[0]
                     err_type = mkinterr.split(" ")[1]
 
-                    print(f'Error: {err}, Error type: {meta_map[err_type]}')
+                    print(f'== Instruction: {i.name}/`{i.opcode}`/`{i.type}`: `{i}`')
+                    print(f'== Error: {err}, Error type: {meta_map[err_type]}')
                     ERR_FN = f.name
                     ERR = meta_map[err_type]
 

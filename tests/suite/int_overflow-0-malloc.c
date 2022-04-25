@@ -1,9 +1,5 @@
 // http://git.gnome.org/browse/evolution-data-server/commit/camel/camel-lock-helper.c?id=0d1d403fab78b869867d50fcc6ee95f503925318
 
-// RUN: clang %s -O0 -S -emit-llvm -o %t.ll
-// RUN: opt -load %builddir/mkint/ -mkint-pass %t.ll -S -o %t.out.ll
-// RUN: AFTER=%t.out.ll python3 %testdir/llvm_lite.py
-
 
 #include <stdio.h>
 #include <stdlib.h>
