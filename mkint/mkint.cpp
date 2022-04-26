@@ -3,6 +3,7 @@
 
 #include <cxxabi.h>
 
+#include <llvm/ADT/APInt.h>
 #include <llvm/ADT/DenseMap.h>
 #include <llvm/ADT/MapVector.h>
 #include <llvm/ADT/SetVector.h>
@@ -217,11 +218,8 @@ std::pair<crange, crange> auto_promote(crange lhs, crange rhs)
     return std::make_pair(lhs, rhs);
 }
 
-crange compute_binary_rng(const BinaryOperator* op, crange lhs_, crange rhs_)
+crange compute_binary_rng(const BinaryOperator* op, crange lhs, crange rhs)
 {
-
-    auto [lhs, rhs] = auto_promote(std::move(lhs_), std::move(rhs_));
-
     switch (op->getOpcode()) {
     case Instruction::Add:
         return lhs.add(rhs);
@@ -279,19 +277,194 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }
     }
 
-    crange get_range_by_bb(const Value* var, const BasicBlock* bb)
+    crange get_range(const Value* var, DenseMap<const Value*, crange>& brange)
     {
-        auto& bb_range = m_func2range_info[bb->getParent()];
+        if (brange.count(var)) {
+            return brange[var];
+        }
+
         if (auto lconst = dyn_cast<ConstantInt>(var)) {
             return crange(lconst->getValue());
         } else {
-            if (bb_range[bb].count(var) == 0) {
-                if (auto gv = dyn_cast<GlobalVariable>(var))
-                    return m_global2range[gv];
-                MKINT_CHECK_ABORT(false) << "Unknown operand type: " << *var;
-            }
-            return bb_range[bb][var];
+            if (auto gv = dyn_cast<GlobalVariable>(var))
+                return m_global2range[gv];
         }
+        MKINT_CHECK_ABORT(false) << "Unknown operand type: " << *var;
+    }
+
+    crange get_range_by_bb(const Value* var, const BasicBlock* bb)
+    {
+        return get_range(var, m_func2range_info[bb->getParent()][bb]);
+    }
+
+    void analyze_one_bb_range(BasicBlock* bb, DenseMap<const Value*, crange>& cur_rng)
+    {
+        auto& F = *bb->getParent();
+        auto& sum_rng = m_func2range_info[&F][bb];
+        for (auto& inst : bb->getInstList()) {
+            const auto get_rng = [&cur_rng, this](auto var) { return get_range(var, cur_rng); };
+            // Store / Call / Return
+            if (const auto call = dyn_cast<CallInst>(&inst)) {
+                if (const auto f = call->getCalledFunction()) {
+                    if (m_callback_tsrc_fn.contains(f->getName())) {
+                        const auto& argcalls = m_func2tsrc[f];
+
+                        for (const auto& arg : f->args()) {
+                            auto& argblock = m_func2range_info[f][&(f->getEntryBlock())];
+                            const size_t arg_idx = arg.getArgNo();
+                            if (arg.getType()->isIntegerTy()) {
+                                argblock[&arg] = get_rng(call->getArgOperand(arg_idx)).unionWith(argblock[&arg]);
+                                m_func2ret_range[argcalls[arg_idx]->getCalledFunction()] = argblock[&arg];
+                            }
+                        }
+                    } else {
+                        for (const auto& arg : f->args()) {
+                            auto& argblock = m_func2range_info[f][&(f->getEntryBlock())];
+                            if (arg.getType()->isIntegerTy())
+                                argblock[&arg] = get_rng(call->getArgOperand(arg.getArgNo())).unionWith(argblock[&arg]);
+                        }
+                    }
+
+                    if (f->getReturnType()->isIntegerTy()) // return value is integer.
+                        cur_rng[call] = m_func2ret_range[f];
+                }
+
+                continue;
+            } else if (const auto store = dyn_cast<StoreInst>(&inst)) {
+                // is global var
+                const auto val = store->getValueOperand();
+                const auto ptr = store->getPointerOperand();
+
+                auto valrng = get_rng(val);
+                if (const auto gv = dyn_cast<GlobalVariable>(ptr)) {
+                    // should be lazy mode. check local vars first and then check global vars.
+                    m_global2range[gv] = m_global2range[gv].unionWith(valrng);
+                } else if (const auto gep = dyn_cast<GetElementPtrInst>(ptr)) {
+                    auto gep_addr = gep->getPointerOperand();
+                    if (auto garr = dyn_cast<GlobalVariable>(gep_addr)) {
+                        if (m_garr2ranges.count(garr) && gep->getNumIndices() == 2) { // all one dim array<int>s!
+                            auto idx = gep->getOperand(2);
+                            const size_t arr_size = m_garr2ranges[garr].size();
+                            const crange idx_rng = get_rng(idx);
+                            const size_t idx_max = idx_rng.getUnsignedMax().getLimitedValue();
+                            if (idx_max >= arr_size)
+                                m_gep_oob.insert(gep);
+
+                            for (size_t i = idx_rng.getUnsignedMin().getLimitedValue(); i < std::min(arr_size, idx_max);
+                                 ++i) {
+                                m_garr2ranges[garr][i] = m_garr2ranges[garr][i].unionWith(valrng);
+                            }
+                        }
+                    }
+                }
+
+                // is local var
+                cur_rng[ptr] = valrng; // better precision.
+                continue;
+            } else if (const auto ret = dyn_cast<ReturnInst>(&inst)) {
+                // low precision: just apply!
+                if (F.getReturnType()->isIntegerTy())
+                    m_func2ret_range[&F] = get_rng(ret->getReturnValue()).unionWith(m_func2ret_range[&F]);
+
+                continue;
+            }
+
+            // return type should be int
+            if (!inst.getType()->isIntegerTy()) {
+                continue;
+            }
+
+            // empty range
+            crange new_range = crange::getEmpty(inst.getType()->getIntegerBitWidth());
+
+            if (const BinaryOperator* op = dyn_cast<BinaryOperator>(&inst)) {
+                auto lhs = op->getOperand(0);
+                auto rhs = op->getOperand(1);
+
+                crange lhs_range = get_rng(lhs), rhs_range = get_rng(rhs);
+                new_range = compute_binary_rng(op, lhs_range, rhs_range);
+                // NOTE: LLVM is not a fan of unary operators.
+                //       -x is represented by 0 - x...
+            } else if (const SelectInst* op = dyn_cast<SelectInst>(&inst)) {
+                const auto tval = op->getTrueValue();
+                const auto fval = op->getFalseValue();
+                auto [lhs, rhs] = auto_promote(get_rng(tval), get_rng(fval));
+                new_range = lhs.unionWith(rhs);
+            } else if (const CastInst* op = dyn_cast<CastInst>(&inst)) {
+                new_range = [op, &get_rng]() -> crange {
+                    auto inprng = get_rng(op->getOperand(0));
+                    const uint32_t bits = op->getType()->getIntegerBitWidth();
+                    switch (op->getOpcode()) {
+                    case CastInst::Trunc:
+                        return inprng.truncate(bits);
+                    case CastInst::ZExt:
+                        return inprng.zeroExtend(bits);
+                    case CastInst::SExt:
+                        return inprng.signExtend(bits); // FIXME: Crash on M1 Mac?
+                                                        // But it is not a problem on Linux.
+                    default:
+                        MKINT_LOG() << "Unhandled Cast Instruction " << op->getOpcodeName()
+                                    << ". Using original range.";
+                    }
+
+                    return inprng;
+                }();
+            } else if (const PHINode* op = dyn_cast<PHINode>(&inst)) {
+                for (size_t i = 0; i < op->getNumIncomingValues(); ++i) {
+                    auto pred = op->getIncomingBlock(i);
+                    if (m_backedges[bb].contains(pred)) {
+                        continue; // skip backedge
+                    }
+                    new_range = new_range.unionWith(get_range_by_bb(op->getIncomingValue(i), pred));
+                }
+            } else if (auto op = dyn_cast<LoadInst>(&inst)) {
+                auto addr = op->getPointerOperand();
+                if (dyn_cast<GlobalVariable>(addr))
+                    new_range = get_rng(addr);
+                else if (auto gep = dyn_cast<GetElementPtrInst>(addr)) {
+                    bool succ = false;
+                    // we only analyze shallow arrays. i.e., one dim.
+                    auto gep_addr = gep->getPointerOperand();
+                    if (auto garr = dyn_cast<GlobalVariable>(gep_addr)) {
+                        if (m_garr2ranges.count(garr) && gep->getNumIndices() == 2) { // all one dim array<int>s!
+                            auto idx = gep->getOperand(2);
+                            const size_t arr_size = m_garr2ranges[garr].size();
+                            const crange idx_rng = get_rng(idx);
+                            const size_t idx_max = idx_rng.getUnsignedMax().getLimitedValue();
+                            if (idx_max >= arr_size) {
+                                m_gep_oob.insert(gep);
+                            }
+
+                            for (size_t i = idx_rng.getUnsignedMin().getLimitedValue(); i < std::min(arr_size, idx_max);
+                                 ++i) {
+                                new_range = new_range.unionWith(m_garr2ranges[garr][i]);
+                            }
+
+                            succ = true;
+                        }
+                    }
+
+                    if (!succ) {
+                        MKINT_WARN() << "Unknown address to load (unknow gep src addr): " << inst;
+                        new_range = crange(op->getType()->getIntegerBitWidth(), true); // unknown addr -> full range.
+                    }
+                } else {
+                    MKINT_WARN() << "Unknown address to load: " << inst;
+                    new_range = crange(op->getType()->getIntegerBitWidth()); // unknown addr -> full range.
+                }
+            } else if (const auto op = dyn_cast<CmpInst>(&inst)) {
+                // can be more precise by comparing the range...
+                // but nah...
+            } else {
+                MKINT_CHECK_RELAX(false) << " [Range Analysis] Unhandled instruction: " << inst;
+            }
+
+            cur_rng[&inst] = new_range.unionWith(cur_rng[&inst]);
+        }
+
+        if (&cur_rng != &sum_rng)
+            for (auto [bb, rng] : cur_rng)
+                sum_rng[bb] = sum_rng.count(bb) ? sum_rng[bb].unionWith(rng) : rng;
     }
 
     void range_analysis(Function& F)
@@ -303,16 +476,16 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         for (auto& bbref : F) {
             auto bb = &bbref;
 
-            auto& cur_rng = bb_range[bb];
+            auto& sum_rng = bb_range[bb];
+
             // merge all incoming bbs
             for (const auto& pred : predecessors(bb)) {
                 // avoid backedge: pred can't be a successor of bb.
-                if (m_backedges[bb].contains(pred)) {
+                if (m_backedges[bb].contains(pred))
                     continue; // skip backedge
-                }
 
-                // branch or switch
-                // NOTE: branch should be used to narrow the range.
+                MKINT_LOG() << "Merging: " << pred << "\t -> " << bb;
+                auto branch_rng = bb_range[pred];
                 if (auto terminator = pred->getTerminator(); auto br = dyn_cast<BranchInst>(terminator)) {
                     if (br->isConditional()) {
                         if (auto cmp = dyn_cast<ICmpInst>(br->getCondition())) {
@@ -324,16 +497,10 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                             if (!lhs->getType()->isIntegerTy() || !rhs->getType()->isIntegerTy()) {
                                 // This should be covered by `ICmpInst`.
                                 MKINT_WARN() << "The br operands are not both integers: " << *cmp;
-                                continue;
+                                continue; // FIXME: !
                             }
 
                             auto lrng = get_range_by_bb(lhs, pred), rrng = get_range_by_bb(rhs, pred);
-
-                            if (cur_rng.count(lhs) == 0)
-                                cur_rng[lhs] = crange(lhs->getType()->getIntegerBitWidth(), false);
-
-                            if (cur_rng.count(rhs) == 0)
-                                cur_rng[rhs] = crange(rhs->getType()->getIntegerBitWidth(), false);
 
                             bool is_true_br = br->getSuccessor(0) == bb;
                             if (is_true_br) { // T branch
@@ -341,44 +508,24 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                                 crange rprng = crange::cmpRegion()(cmp->getSwappedPredicate(), lrng);
 
                                 // Don't change constant's value.
-                                cur_rng[lhs] = dyn_cast<ConstantInt>(lhs)
-                                    ? lrng
-                                    : lrng.intersectWith(lprng).unionWith(cur_rng[lhs]);
-                                cur_rng[rhs] = dyn_cast<ConstantInt>(rhs)
-                                    ? rrng
-                                    : rrng.intersectWith(rprng).unionWith(cur_rng[rhs]);
+                                branch_rng[lhs] = dyn_cast<ConstantInt>(lhs) ? lrng : lrng.intersectWith(lprng);
+                                branch_rng[rhs] = dyn_cast<ConstantInt>(rhs) ? rrng : rrng.intersectWith(rprng);
                             } else { // F branch
                                 crange lprng = crange::cmpRegion()(cmp->getInversePredicate(), rrng);
                                 crange rprng
                                     = crange::cmpRegion()(CmpInst::getInversePredicate(cmp->getPredicate()), lrng);
                                 // Don't change constant's value.
-                                cur_rng[lhs] = dyn_cast<ConstantInt>(lhs)
-                                    ? lrng
-                                    : lrng.intersectWith(lprng).unionWith(cur_rng[lhs]);
-                                cur_rng[rhs] = dyn_cast<ConstantInt>(rhs)
-                                    ? rrng
-                                    : rrng.intersectWith(rprng).unionWith(cur_rng[rhs]);
+                                branch_rng[lhs] = dyn_cast<ConstantInt>(lhs) ? lrng : lrng.intersectWith(lprng);
+                                branch_rng[rhs] = dyn_cast<ConstantInt>(rhs) ? rrng : rrng.intersectWith(rprng);
                             }
 
-                            if (cur_rng[lhs].isEmptySet() || cur_rng[rhs].isEmptySet()) {
-                                // TODO: higher precision.
-                                m_impossible_branches[cmp] = is_true_br;
-                            }
+                            if (branch_rng[lhs].isEmptySet() || branch_rng[rhs].isEmptySet())
+                                m_impossible_branches[cmp] = is_true_br; // TODO: higher precision.
+                            else
+                                branch_rng[cmp] = crange(APInt(1, is_true_br));
                         }
                     }
                 } else if (auto swt = dyn_cast<SwitchInst>(terminator)) {
-                    // switch
-                    // ; Emulate a conditional br instruction
-                    // %Val = zext i1 %value to i32
-                    // switch i32 %Val, label %truedest [ i32 0, label %falsedest ]
-
-                    // ; Emulate an unconditional br instruction
-                    // switch i32 0, label %dest [ ]
-
-                    // ; Implement a jump table:
-                    // switch i32 %val, label %otherwise [ i32 0, label %onzero
-                    //                                     i32 1, label %onone
-                    //                                     i32 2, label %ontwo ]
                     auto cond = swt->getCondition();
                     if (cond->getType()->isIntegerTy()) {
                         auto cond_rng = get_range_by_bb(cond, pred);
@@ -400,7 +547,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                             }
                         }
 
-                        cur_rng[cond] = cond_rng.unionWith(emp_rng);
+                        branch_rng[cond] = cond_rng.unionWith(emp_rng);
                     }
                 } else {
                     // try catch... (thank god, C does not have try-catch)
@@ -408,177 +555,12 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                     MKINT_CHECK_ABORT(false) << "Unknown terminator: " << *pred->getTerminator();
                 }
 
-                for (const auto& [inst, rng] : bb_range[pred]) {
-                    // TODO: Optimization: No need to track all values.
-                    if (auto it = cur_rng.find(inst); it == cur_rng.end()) { // not found
-                        cur_rng[inst] = rng;
-                    } else { // merge
-                        it->second = it->second.unionWith(rng);
-                    }
-                }
+                analyze_one_bb_range(bb, branch_rng);
             }
 
-            for (auto& inst : bb->getInstList()) {
-                const auto get_rng = [&bb, this](auto var) { return get_range_by_bb(var, bb); };
-                // Store / Call / Return
-                if (const auto call = dyn_cast<CallInst>(&inst)) {
-                    if (const auto f = call->getCalledFunction()) {
-                        if (m_callback_tsrc_fn.contains(f->getName())) {
-                            const auto& argcalls = m_func2tsrc[f];
-
-                            for (const auto& arg : f->args()) {
-                                auto& argblock = m_func2range_info[f][&(f->getEntryBlock())];
-                                const size_t arg_idx = arg.getArgNo();
-                                if (arg.getType()->isIntegerTy()) {
-                                    argblock[&arg] = get_rng(call->getArgOperand(arg_idx)).unionWith(argblock[&arg]);
-                                    m_func2ret_range[argcalls[arg_idx]->getCalledFunction()] = argblock[&arg];
-                                }
-                            }
-                        } else {
-                            for (const auto& arg : f->args()) {
-                                auto& argblock = m_func2range_info[f][&(f->getEntryBlock())];
-                                if (arg.getType()->isIntegerTy())
-                                    argblock[&arg]
-                                        = get_rng(call->getArgOperand(arg.getArgNo())).unionWith(argblock[&arg]);
-                            }
-                        }
-
-                        if (f->getReturnType()->isIntegerTy()) // return value is integer.
-                            cur_rng[call] = m_func2ret_range[f];
-                    }
-
-                    continue;
-                } else if (const auto store = dyn_cast<StoreInst>(&inst)) {
-                    // is global var
-                    const auto val = store->getValueOperand();
-                    const auto ptr = store->getPointerOperand();
-
-                    auto valrng = get_rng(val);
-                    if (const auto gv = dyn_cast<GlobalVariable>(ptr)) {
-                        // should be lazy mode. check local vars first and then check global vars.
-                        m_global2range[gv] = m_global2range[gv].unionWith(valrng);
-                    } else if (const auto gep = dyn_cast<GetElementPtrInst>(ptr)) {
-                        auto gep_addr = gep->getPointerOperand();
-                        if (auto garr = dyn_cast<GlobalVariable>(gep_addr)) {
-                            if (m_garr2ranges.count(garr) && gep->getNumIndices() == 2) { // all one dim array<int>s!
-                                auto idx = gep->getOperand(2);
-                                const size_t arr_size = m_garr2ranges[garr].size();
-                                const crange idx_rng = get_rng(idx);
-                                const size_t idx_max = idx_rng.getUnsignedMax().getLimitedValue();
-                                if (idx_max >= arr_size)
-                                    m_gep_oob.insert(gep);
-
-                                for (size_t i = idx_rng.getUnsignedMin().getLimitedValue();
-                                     i < std::min(arr_size, idx_max); ++i) {
-                                    m_garr2ranges[garr][i] = m_garr2ranges[garr][i].unionWith(valrng);
-                                }
-                            }
-                        }
-                    }
-
-                    // is local var
-                    cur_rng[ptr] = valrng; // better precision.
-                    continue;
-                } else if (const auto ret = dyn_cast<ReturnInst>(&inst)) {
-                    // low precision: just apply!
-                    if (F.getReturnType()->isIntegerTy())
-                        m_func2ret_range[&F] = get_rng(ret->getReturnValue()).unionWith(m_func2ret_range[&F]);
-
-                    continue;
-                }
-
-                // return type should be int
-                if (!inst.getType()->isIntegerTy()) {
-                    continue;
-                }
-
-                // empty range
-                crange new_range = crange::getEmpty(inst.getType()->getIntegerBitWidth());
-
-                if (const BinaryOperator* op = dyn_cast<BinaryOperator>(&inst)) {
-                    auto lhs = op->getOperand(0);
-                    auto rhs = op->getOperand(1);
-
-                    crange lhs_range = get_rng(lhs), rhs_range = get_rng(rhs);
-                    new_range = compute_binary_rng(op, lhs_range, rhs_range);
-                    // NOTE: LLVM is not a fan of unary operators.
-                    //       -x is represented by 0 - x...
-                } else if (const SelectInst* op = dyn_cast<SelectInst>(&inst)) {
-                    const auto tval = op->getTrueValue();
-                    const auto fval = op->getFalseValue();
-                    auto [lhs, rhs] = auto_promote(get_rng(tval), get_rng(fval));
-                    new_range = lhs.unionWith(rhs);
-                } else if (const CastInst* op = dyn_cast<CastInst>(&inst)) {
-                    new_range = [op, &get_rng]() -> crange {
-                        auto inprng = get_rng(op->getOperand(0));
-                        const uint32_t bits = op->getType()->getIntegerBitWidth();
-                        switch (op->getOpcode()) {
-                        case CastInst::Trunc:
-                            return inprng.truncate(bits);
-                        case CastInst::ZExt:
-                            return inprng.zeroExtend(bits);
-                        case CastInst::SExt:
-                            return inprng.signExtend(bits); // FIXME: Crash on M1 Mac?
-                                                            // But it is not a problem on Linux.
-                        default:
-                            MKINT_LOG() << "Unhandled Cast Instruction " << op->getOpcodeName()
-                                        << ". Using original range.";
-                        }
-
-                        return inprng;
-                    }();
-                } else if (const PHINode* op = dyn_cast<PHINode>(&inst)) {
-                    for (size_t i = 0; i < op->getNumIncomingValues(); ++i) {
-                        auto pred = op->getIncomingBlock(i);
-                        if (m_backedges[bb].contains(pred)) {
-                            continue; // skip backedge
-                        }
-                        new_range = new_range.unionWith(get_range_by_bb(op->getIncomingValue(i), pred));
-                    }
-                } else if (auto op = dyn_cast<LoadInst>(&inst)) {
-                    auto addr = op->getPointerOperand();
-                    if (dyn_cast<GlobalVariable>(addr))
-                        new_range = get_rng(addr);
-                    else if (auto gep = dyn_cast<GetElementPtrInst>(addr)) {
-                        bool succ = false;
-                        // we only analyze shallow arrays. i.e., one dim.
-                        auto gep_addr = gep->getPointerOperand();
-                        if (auto garr = dyn_cast<GlobalVariable>(gep_addr)) {
-                            if (m_garr2ranges.count(garr) && gep->getNumIndices() == 2) { // all one dim array<int>s!
-                                auto idx = gep->getOperand(2);
-                                const size_t arr_size = m_garr2ranges[garr].size();
-                                const crange idx_rng = get_rng(idx);
-                                const size_t idx_max = idx_rng.getUnsignedMax().getLimitedValue();
-                                if (idx_max >= arr_size) {
-                                    m_gep_oob.insert(gep);
-                                }
-
-                                for (size_t i = idx_rng.getUnsignedMin().getLimitedValue();
-                                     i < std::min(arr_size, idx_max); ++i) {
-                                    new_range = new_range.unionWith(m_garr2ranges[garr][i]);
-                                }
-
-                                succ = true;
-                            }
-                        }
-
-                        if (!succ) {
-                            MKINT_WARN() << "Unknown address to load (unknow gep src addr): " << inst;
-                            new_range
-                                = crange(op->getType()->getIntegerBitWidth(), true); // unknown addr -> full range.
-                        }
-                    } else {
-                        MKINT_WARN() << "Unknown address to load: " << inst;
-                        new_range = crange(op->getType()->getIntegerBitWidth()); // unknown addr -> full range.
-                    }
-                } else if (const auto op = dyn_cast<CmpInst>(&inst)) {
-                    // can be more precise by comparing the range...
-                    // but nah...
-                } else {
-                    MKINT_CHECK_RELAX(false) << " [Range Analysis] Unhandled instruction: " << inst;
-                }
-
-                cur_rng[&inst] = new_range.unionWith(cur_rng[&inst]);
+            if (!bb->hasNPredecessorsOrMore(1)) {
+                MKINT_LOG() << "No predecessors: " << bb;
+                analyze_one_bb_range(bb, sum_rng);
             }
         }
     }
@@ -809,6 +791,9 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 backedge_analysis(F);
             }
         }
+
+        MKINT_LOG() << "Module after taint:";
+        MKINT_LOG() << M;
 
         this->init_ranges(M);
         while (true) { // iterative range analysis.
