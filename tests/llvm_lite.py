@@ -15,7 +15,8 @@ ERR_NAME_MAP = {
     "array_index": "array index out of bound",
     "bad_shift": "bad shift",
     "cmp_true": "impossible true branch",
-    "cmp_false": "impossible false branch"
+    "cmp_false": "impossible false branch",
+    "div_by_zero": "divide by zero" 
 }
 
 class TestMKint(unittest.TestCase):
