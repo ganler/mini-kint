@@ -12,7 +12,10 @@ llvm.initialize_native_asmprinter()  # yes, even this one
 ERR_NAME_MAP = {
     "int_overflow": "integer overflow",
     "int_overflow_ub": "integer overflow",
-    "array_index": "array index out of bound"
+    "array_index": "array index out of bound",
+    "bad_shift": "bad shift",
+    "cmp_true": "impossible true branch",
+    "cmp_false": "impossible false branch"
 }
 
 class TestMKint(unittest.TestCase):
@@ -110,6 +113,8 @@ class TestMKint(unittest.TestCase):
 
                     # for o in i.operands:
                     #     print(f'Operand: {o.name}/{o.type}')
+
+        print(f'== ERR: {ERR}, ERR_FN: {ERR_FN}')
 
         if ERR_FN_NAME == "none":
             assert ERR == None
