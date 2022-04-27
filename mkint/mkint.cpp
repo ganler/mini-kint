@@ -948,6 +948,10 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                             MKINT_LOG() << GV.getName() << "[" << i << "] init by " << init_val;
                             m_garr2ranges[&GV].push_back(crange(init_val));
                         }
+                    } else if (auto zinit = dyn_cast<ConstantAggregateZero>(GV.getInitializer())) {
+                        for (size_t i = 0; i < zinit->getElementCount().getFixedValue(); i++)
+                            m_garr2ranges[&GV].push_back(crange(
+                                APInt::getNullValue(zinit->getElementValue(i)->getType()->getIntegerBitWidth())));
                     } else {
                         MKINT_CHECK_ABORT(false) << "Unsupported initializer for global array: " << GV.getName();
                     }
