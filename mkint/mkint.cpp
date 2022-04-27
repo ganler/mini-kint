@@ -1010,17 +1010,21 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }
     }
 
-    void add_range_cons(const crange rng, const z3::expr& bv)
+    bool add_range_cons(const crange rng, const z3::expr& bv)
     {
         if (rng.isFullSet() || bv.is_const())
-            return;
+            return true;
 
-        MKINT_CHECK(!rng.isEmptySet()) << "lhs is empty set";
+        if (rng.isEmptySet()) {
+            MKINT_CHECK_RELAX(false) << "lhs is empty set";
+            return false;
+        }
 
         m_solver.value().add(
             z3::ule(bv, m_solver.value().ctx().bv_val(rng.getUnsignedMax().getZExtValue(), rng.getBitWidth())));
         m_solver.value().add(
             z3::uge(bv, m_solver.value().ctx().bv_val(rng.getUnsignedMin().getZExtValue(), rng.getBitWidth())));
+        return true;
     }
 
     // for general: check overflow;
@@ -1387,14 +1391,17 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             if (auto op = dyn_cast<BinaryOperator>(&inst)) {
                 binary_check(op);
                 m_v2sym[op] = binary_op_propagate(op);
-                add_range_cons(get_range_by_bb(&inst, inst.getParent()), v2sym(op));
+                if (!add_range_cons(get_range_by_bb(&inst, inst.getParent()), v2sym(op)))
+                    return;
             } else if (auto op = dyn_cast<CastInst>(&inst)) {
                 m_v2sym[op] = cast_op_propagate(op);
-                add_range_cons(get_range_by_bb(&inst, inst.getParent()), v2sym(op));
+                if (!add_range_cons(get_range_by_bb(&inst, inst.getParent()), v2sym(op)))
+                    return;
             } else {
                 const auto name = "\%vid" + std::to_string(inst.getValueID());
                 m_v2sym[&inst] = m_solver.value().ctx().bv_const(name.c_str(), inst.getType()->getIntegerBitWidth());
-                add_range_cons(get_range_by_bb(&inst, inst.getParent()), v2sym(&inst));
+                if (!add_range_cons(get_range_by_bb(&inst, inst.getParent()), v2sym(&inst)))
+                    return;
             }
         }
 
