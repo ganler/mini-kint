@@ -224,16 +224,6 @@ static std::vector<CallInst*> get_taint_source(Function& F)
 
 static bool is_taint_src_arg_call(StringRef s) { return s.contains(MKINT_TAINT_SRC_SUFFX); }
 
-std::pair<crange, crange> auto_promote(crange lhs, crange rhs)
-{
-    if (lhs.getBitWidth() < rhs.getBitWidth()) {
-        lhs = lhs.zextOrTrunc(lhs.getBitWidth());
-    } else if (lhs.getBitWidth() > rhs.getBitWidth()) {
-        rhs = rhs.zextOrTrunc(rhs.getBitWidth());
-    }
-    return std::make_pair(lhs, rhs);
-}
-
 crange compute_binary_rng(const BinaryOperator* op, crange lhs, crange rhs)
 {
     switch (op->getOpcode()) {
@@ -311,6 +301,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 return m_global2range[gv];
         }
         MKINT_WARN() << "Unknown operand type: " << *var;
+        return crange(var->getType()->getIntegerBitWidth(), true);
     }
 
     crange get_range_by_bb(const Value* var, const BasicBlock* bb)
@@ -355,6 +346,9 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 // is global var
                 const auto val = store->getValueOperand();
                 const auto ptr = store->getPointerOperand();
+
+                if (!val->getType()->isIntegerTy())
+                    continue;
 
                 auto valrng = get_rng(val);
                 if (const auto gv = dyn_cast<GlobalVariable>(ptr)) {
@@ -409,8 +403,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             } else if (const SelectInst* op = dyn_cast<SelectInst>(&inst)) {
                 const auto tval = op->getTrueValue();
                 const auto fval = op->getFalseValue();
-                auto [lhs, rhs] = auto_promote(get_rng(tval), get_rng(fval));
-                new_range = lhs.unionWith(rhs);
+                new_range = get_rng(tval).unionWith(get_rng(fval));
             } else if (const CastInst* op = dyn_cast<CastInst>(&inst)) {
                 new_range = [op, &get_rng]() -> crange {
                     auto inprng = get_rng(op->getOperand(0));
@@ -505,7 +498,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 if (m_backedges[bb].contains(pred))
                     continue; // skip backedge
 
-                MKINT_LOG() << "Merging: " << pred << "\t -> " << bb;
+                MKINT_LOG() << "Merging: " << get_bb_label(pred) << "\t -> " << get_bb_label(bb);
                 auto branch_rng = bb_range[pred];
                 if (auto terminator = pred->getTerminator(); auto br = dyn_cast<BranchInst>(terminator)) {
                     if (br->isConditional()) {
@@ -518,32 +511,31 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                             if (!lhs->getType()->isIntegerTy() || !rhs->getType()->isIntegerTy()) {
                                 // This should be covered by `ICmpInst`.
                                 MKINT_WARN() << "The br operands are not both integers: " << *cmp;
-                                continue; // FIXME: !
+                            } else {
+                                auto lrng = get_range_by_bb(lhs, pred), rrng = get_range_by_bb(rhs, pred);
+
+                                bool is_true_br = br->getSuccessor(0) == bb;
+                                if (is_true_br) { // T branch
+                                    crange lprng = crange::cmpRegion()(cmp->getPredicate(), rrng);
+                                    crange rprng = crange::cmpRegion()(cmp->getSwappedPredicate(), lrng);
+
+                                    // Don't change constant's value.
+                                    branch_rng[lhs] = dyn_cast<ConstantInt>(lhs) ? lrng : lrng.intersectWith(lprng);
+                                    branch_rng[rhs] = dyn_cast<ConstantInt>(rhs) ? rrng : rrng.intersectWith(rprng);
+                                } else { // F branch
+                                    crange lprng = crange::cmpRegion()(cmp->getInversePredicate(), rrng);
+                                    crange rprng
+                                        = crange::cmpRegion()(CmpInst::getInversePredicate(cmp->getPredicate()), lrng);
+                                    // Don't change constant's value.
+                                    branch_rng[lhs] = dyn_cast<ConstantInt>(lhs) ? lrng : lrng.intersectWith(lprng);
+                                    branch_rng[rhs] = dyn_cast<ConstantInt>(rhs) ? rrng : rrng.intersectWith(rprng);
+                                }
+
+                                if (branch_rng[lhs].isEmptySet() || branch_rng[rhs].isEmptySet())
+                                    m_impossible_branches[cmp] = is_true_br; // TODO: higher precision.
+                                else
+                                    branch_rng[cmp] = crange(APInt(1, is_true_br));
                             }
-
-                            auto lrng = get_range_by_bb(lhs, pred), rrng = get_range_by_bb(rhs, pred);
-
-                            bool is_true_br = br->getSuccessor(0) == bb;
-                            if (is_true_br) { // T branch
-                                crange lprng = crange::cmpRegion()(cmp->getPredicate(), rrng);
-                                crange rprng = crange::cmpRegion()(cmp->getSwappedPredicate(), lrng);
-
-                                // Don't change constant's value.
-                                branch_rng[lhs] = dyn_cast<ConstantInt>(lhs) ? lrng : lrng.intersectWith(lprng);
-                                branch_rng[rhs] = dyn_cast<ConstantInt>(rhs) ? rrng : rrng.intersectWith(rprng);
-                            } else { // F branch
-                                crange lprng = crange::cmpRegion()(cmp->getInversePredicate(), rrng);
-                                crange rprng
-                                    = crange::cmpRegion()(CmpInst::getInversePredicate(cmp->getPredicate()), lrng);
-                                // Don't change constant's value.
-                                branch_rng[lhs] = dyn_cast<ConstantInt>(lhs) ? lrng : lrng.intersectWith(lprng);
-                                branch_rng[rhs] = dyn_cast<ConstantInt>(rhs) ? rrng : rrng.intersectWith(rprng);
-                            }
-
-                            if (branch_rng[lhs].isEmptySet() || branch_rng[rhs].isEmptySet())
-                                m_impossible_branches[cmp] = is_true_br; // TODO: higher precision.
-                            else
-                                branch_rng[cmp] = crange(APInt(1, is_true_br));
                         }
                     }
                 } else if (auto swt = dyn_cast<SwitchInst>(terminator)) {
@@ -579,11 +571,20 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 analyze_one_bb_range(bb, branch_rng);
             }
 
-            if (!bb->hasNPredecessorsOrMore(1)) {
+            if (bb->isEntryBlock()) {
                 MKINT_LOG() << "No predecessors: " << bb;
                 analyze_one_bb_range(bb, sum_rng);
             }
         }
+    }
+
+    static std::string get_bb_label(const BasicBlock* bb)
+    {
+        std::string str;
+        raw_string_ostream os(str);
+        bb->printAsOperand(os, false);
+
+        return std::move(str);
     }
 
     static SmallVector<Function*, 2> get_sink_fns(Instruction* inst) noexcept
@@ -1344,8 +1345,8 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
 
                             const auto check = [cmp, is_true_br, this] {
                                 if (m_solver.value().check() == z3::unsat) { // counter example
-                                    MKINT_WARN() << "[SMT Solving] Found dead branch in " << *cmp << ": " << is_true_br;
-                                    m_impossible_branches[cmp] = is_true_br;
+                                    MKINT_WARN() << "[SMT Solving] cannot continue " << (is_true_br ? "true" : "false")
+                                                 << " branch of " << *cmp;
                                     return false;
                                 }
                                 return true;
