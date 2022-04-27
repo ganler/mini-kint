@@ -20,6 +20,7 @@
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/Metadata.h>
+#include <llvm/IR/Module.h>
 #include <llvm/IR/Operator.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Value.h>
@@ -67,10 +68,10 @@ template <typename V, typename... Vs> static constexpr std::array<V, sizeof...(V
 constexpr auto MKINT_SINKS = mkarray<std::pair<const char*, size_t>>(std::pair { "malloc", 0 },
     std::pair { "__mkint_sink0", 0 }, std::pair { "__mkint_sink1", 1 }, std::pair { "xmalloc", 0 },
     std::pair { "kmalloc", 0 }, std::pair { "kzalloc", 0 }, std::pair { "vmalloc", 0 }, std::pair { "mem_alloc", 0 },
-    std::pair { "__page_empty", 0 }, std::pair { "agp_alloc_page_array", 0 }, std::pair { "copy_from_user", 2 }, std::pair { "__writel", 0 },
-    std::pair { "access_ok", 2 }, std::pair { "btrfs_lookup_first_ordered_extent", 1 }, std::pair { "sys_cfg80211_find_ie", 2 }, std::pair { "gdth_ioctl_alloc", 1 },
-    std::pair { "sock_alloc_send_skb", 1 }, std::pair { "memcpy", 2 }
-    );
+    std::pair { "__page_empty", 0 }, std::pair { "agp_alloc_page_array", 0 }, std::pair { "copy_from_user", 2 },
+    std::pair { "__writel", 0 }, std::pair { "access_ok", 2 }, std::pair { "btrfs_lookup_first_ordered_extent", 1 },
+    std::pair { "sys_cfg80211_find_ie", 2 }, std::pair { "gdth_ioctl_alloc", 1 },
+    std::pair { "sock_alloc_send_skb", 1 }, std::pair { "memcpy", 2 });
 
 struct crange : public ConstantRange {
     /// https://llvm.org/doxygen/classllvm_1_1ConstantRange.html
@@ -154,9 +155,11 @@ std::string_view mkstr(interr err)
     case interr::DEAD_FALSE_BR:
         return mkstr<interr::DEAD_FALSE_BR>();
     default:
-        assert(false && "unknown error type");
-        return ""; // statically impossible
+        break;
     }
+
+    MKINT_CHECK_ABORT(false) << "unknown error type" << static_cast<int>(err);
+    return ""; // statically impossible
 }
 
 template <interr err_t, typename I> static std::enable_if_t<std::is_pointer_v<I>> mark_err(I inst)
@@ -259,6 +262,11 @@ crange compute_binary_rng(const BinaryOperator* op, crange lhs, crange rhs)
 }
 
 struct MKintPass : public PassInfoMixin<MKintPass> {
+    MKintPass()
+        : m_solver(std::nullopt)
+    {
+    }
+
     void backedge_analysis(const Function& F)
     {
         for (const auto& bb_ref : F) {
@@ -763,6 +771,10 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
     {
         MKINT_LOG() << "Running MKint pass on module " << M.getName();
 
+        // FIXME: This is a hack.
+        auto ctx = new z3::context; // let it leak.
+        m_solver = z3::solver(*ctx);
+
         // Mark taint sources.
         for (auto& F : M) {
             auto taint_sources = get_taint_source(F);
@@ -821,17 +833,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }
         this->pring_all_ranges();
 
-        for (auto& F : m_taint_funcs) {
-            for (auto& bb : F->getBasicBlockList()) {
-                for (auto& inst : bb) {
-                    if (auto bop = dyn_cast<BinaryOperator>(&inst)) {
-                        auto lhs = get_range_by_bb(bop->getOperand(0), &bb);
-                        auto rhs = get_range_by_bb(bop->getOperand(1), &bb);
-                        binary_check(bop, lhs, rhs);
-                    }
-                }
-            }
-        }
+        this->smt_solving(M);
 
         this->mark_errors();
 
@@ -1008,22 +1010,27 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }
     }
 
+    void add_range_cons(const crange rng, const z3::expr& bv)
+    {
+        if (rng.isFullSet() || bv.is_const())
+            return;
+
+        MKINT_CHECK(!rng.isEmptySet()) << "lhs is empty set";
+
+        m_solver.value().add(
+            z3::ule(bv, m_solver.value().ctx().bv_val(rng.getUnsignedMax().getZExtValue(), rng.getBitWidth())));
+        m_solver.value().add(
+            z3::uge(bv, m_solver.value().ctx().bv_val(rng.getUnsignedMin().getZExtValue(), rng.getBitWidth())));
+    }
+
     // for general: check overflow;
     // for shl:     check shift amount;
     // for div:     check divisor != 0;
-    void binary_check(BinaryOperator* op, const crange& lhs, const crange& rhs)
+    void binary_check(BinaryOperator* op)
     {
-        if (lhs.isEmptySet() || rhs.isEmptySet()) {
-            MKINT_LOG() << "Skip due empty range in operands: " << *op;
-            return;
-        }
-
-        z3::context ctx;
-        z3::solver s(ctx);
-
-        // create a int symbol
-        z3::expr lhs_bv = ctx.bv_const("lhs", lhs.getBitWidth());
-        z3::expr rhs_bv = ctx.bv_const("rhs", lhs.getBitWidth());
+        const auto& lhs_bv = v2sym(op->getOperand(0));
+        const auto& rhs_bv = v2sym(op->getOperand(1));
+        const auto rhs_bits = rhs_bv.get_sort().bv_size();
 
         const auto [is_nsw, is_nuw] = [op] {
             if (const auto ofop = dyn_cast<OverflowingBinaryOperator>(op)) {
@@ -1032,23 +1039,9 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             return std::make_pair(false, false);
         }();
 
-        const auto add_signed_cons = [&] {
-            s.add(z3::sle(lhs_bv, ctx.bv_val(lhs.getSignedMax().getSExtValue(), lhs.getBitWidth())));
-            s.add(z3::sge(lhs_bv, ctx.bv_val(lhs.getSignedMin().getSExtValue(), lhs.getBitWidth())));
-            s.add(z3::sle(rhs_bv, ctx.bv_val(rhs.getSignedMax().getSExtValue(), lhs.getBitWidth())));
-            s.add(z3::sge(rhs_bv, ctx.bv_val(rhs.getSignedMin().getSExtValue(), lhs.getBitWidth())));
-        };
-
-        const auto add_unsigned_cons = [&] {
-            s.add(z3::ule(lhs_bv, ctx.bv_val(lhs.getUnsignedMax().getZExtValue(), lhs.getBitWidth())));
-            s.add(z3::uge(lhs_bv, ctx.bv_val(lhs.getUnsignedMin().getZExtValue(), lhs.getBitWidth())));
-            s.add(z3::ule(rhs_bv, ctx.bv_val(rhs.getUnsignedMax().getZExtValue(), lhs.getBitWidth())));
-            s.add(z3::uge(rhs_bv, ctx.bv_val(rhs.getUnsignedMin().getZExtValue(), lhs.getBitWidth())));
-        };
-
-        const auto check = [&](interr et, bool is_signed) {
-            if (s.check() == z3::sat) { // counter example
-                z3::model m = s.get_model();
+        const auto check = [&, this](interr et, bool is_signed) {
+            if (m_solver.value().check() == z3::sat) { // counter example
+                z3::model m = m_solver.value().get_model();
                 MKINT_WARN() << rang::fg::yellow << rang::style::bold << mkstr(et) << rang::style::reset << " at "
                              << rang::bg::black << rang::fg::red << op->getParent()->getParent()->getName()
                              << "::" << *op << rang::style::reset;
@@ -1080,67 +1073,58 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             }
         };
 
+        m_solver.value().push();
         switch (op->getOpcode()) {
         case Instruction::Add:
             if (!is_nsw) { // unsigned
-                add_unsigned_cons();
-                s.add(!z3 ::bvadd_no_overflow(lhs_bv, rhs_bv, false));
+                m_solver.value().add(!z3 ::bvadd_no_overflow(lhs_bv, rhs_bv, false));
                 check(interr::OVERFLOW, false);
             } else {
-                add_signed_cons();
-                s.add(!z3::bvadd_no_overflow(lhs_bv, rhs_bv, true));
-                s.add(!z3::bvadd_no_underflow(lhs_bv, rhs_bv));
+                m_solver.value().add(!z3::bvadd_no_overflow(lhs_bv, rhs_bv, true));
+                m_solver.value().add(!z3::bvadd_no_underflow(lhs_bv, rhs_bv));
                 check(interr::OVERFLOW, true);
             }
 
             break;
         case Instruction::Sub:
             if (!is_nsw) {
-                add_unsigned_cons();
-                s.add(!z3::bvsub_no_underflow(lhs_bv, rhs_bv, false));
+                m_solver.value().add(!z3::bvsub_no_underflow(lhs_bv, rhs_bv, false));
                 check(interr::OVERFLOW, false);
             } else {
-                add_signed_cons();
-                s.add(!z3::bvsub_no_underflow(lhs_bv, rhs_bv, true));
-                s.add(!z3::bvsub_no_overflow(lhs_bv, rhs_bv));
+                m_solver.value().add(!z3::bvsub_no_underflow(lhs_bv, rhs_bv, true));
+                m_solver.value().add(!z3::bvsub_no_overflow(lhs_bv, rhs_bv));
                 check(interr::OVERFLOW, true);
             }
 
             break;
         case Instruction::Mul:
             if (!is_nsw) {
-                add_unsigned_cons();
-                s.add(!z3::bvmul_no_overflow(lhs_bv, rhs_bv, false));
+                m_solver.value().add(!z3::bvmul_no_overflow(lhs_bv, rhs_bv, false));
                 check(interr::OVERFLOW, false);
             } else {
-                add_signed_cons();
-                s.add(!z3::bvmul_no_overflow(lhs_bv, rhs_bv, true));
-                s.add(!z3::bvmul_no_underflow(lhs_bv, rhs_bv)); // INTMAX * -1
+                m_solver.value().add(!z3::bvmul_no_overflow(lhs_bv, rhs_bv, true));
+                m_solver.value().add(!z3::bvmul_no_underflow(lhs_bv, rhs_bv)); // INTMAX * -1
                 check(interr::OVERFLOW, true);
             }
             break;
         case Instruction::URem:
         case Instruction::UDiv:
-            add_unsigned_cons();
-            s.add(rhs_bv == ctx.bv_val(0, rhs.getBitWidth()));
+            m_solver.value().add(rhs_bv == m_solver.value().ctx().bv_val(0, rhs_bits));
             check(interr::DIV_BY_ZERO, false);
             break;
         case Instruction::SRem:
         case Instruction::SDiv: // can be overflow or divisor == 0
-            add_signed_cons();
-            s.push();
-            s.add(rhs_bv == ctx.bv_val(0, rhs.getBitWidth())); // may 0?
+            m_solver.value().push();
+            m_solver.value().add(rhs_bv == m_solver.value().ctx().bv_val(0, rhs_bits)); // may 0?
             check(interr::DIV_BY_ZERO, true);
-            s.pop();
-            s.add(z3::bvsdiv_no_overflow(lhs_bv, rhs_bv));
+            m_solver.value().pop();
+            m_solver.value().add(z3::bvsdiv_no_overflow(lhs_bv, rhs_bv));
             check(interr::OVERFLOW, true);
             break;
         case Instruction::Shl:
         case Instruction::LShr:
         case Instruction::AShr:
-            s.add(rhs_bv <= ctx.bv_val(rhs.getSignedMax().getZExtValue(), rhs.getBitWidth()));
-            s.add(rhs_bv >= ctx.bv_val(rhs.getSignedMin().getZExtValue(), rhs.getBitWidth()));
-            s.add(rhs_bv >= ctx.bv_val(rhs.getBitWidth(), rhs.getBitWidth())); // sat means bug
+            m_solver.value().add(rhs_bv >= m_solver.value().ctx().bv_val(rhs_bits, rhs_bits)); // sat means bug
             check(interr::BAD_SHIFT, false);
             break;
         case Instruction::And:
@@ -1150,6 +1134,65 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         default:
             break;
         }
+        m_solver.value().pop();
+    }
+
+    z3::expr binary_op_propagate(BinaryOperator* op)
+    {
+        const auto lhs = v2sym(op->getOperand(0));
+        const auto rhs = v2sym(op->getOperand(1));
+        switch (op->getOpcode()) {
+        case Instruction::Add:
+            return lhs + rhs;
+        case Instruction::Sub:
+            return lhs - rhs;
+        case Instruction::Mul:
+            return lhs * rhs;
+        case Instruction::URem:
+            return z3::urem(lhs, rhs);
+        case Instruction::UDiv:
+            return z3::udiv(lhs, rhs);
+        case Instruction::SRem:
+            return z3::srem(lhs, rhs);
+        case Instruction::SDiv: // can be overflow or divisor == 0
+            return lhs / rhs;
+        case Instruction::Shl:
+            return z3::shl(lhs, rhs);
+        case Instruction::LShr:
+            return z3::lshr(lhs, rhs);
+        case Instruction::AShr:
+            return z3::ashr(lhs, rhs);
+        case Instruction::And:
+            return lhs & rhs;
+        case Instruction::Or:
+            return lhs | rhs;
+        case Instruction::Xor:
+            return lhs ^ rhs;
+        default:
+            break;
+        }
+
+        MKINT_CHECK_ABORT(false) << "unsupported binary op: " << *op;
+        return lhs; // dummy
+    }
+
+    z3::expr cast_op_propagate(CastInst* op)
+    {
+        const auto src = v2sym(op->getOperand(0));
+        const uint32_t bits = op->getType()->getIntegerBitWidth();
+        switch (op->getOpcode()) {
+        case CastInst::Trunc:
+            return src.extract(bits, 0);
+        case CastInst::ZExt:
+            return z3::zext(src, bits - op->getOperand(0)->getType()->getIntegerBitWidth());
+        case CastInst::SExt:
+            return z3::sext(src, bits - op->getOperand(0)->getType()->getIntegerBitWidth());
+        default:
+            MKINT_WARN() << "Unhandled Cast Instruction " << op->getOpcodeName() << ". Using original range.";
+        }
+
+        const std::string new_sym_str = "\%cast" + std::to_string(op->getValueID());
+        return m_solver.value().ctx().bv_const(new_sym_str.c_str(), bits); // new expr
     }
 
     void mark_errors()
@@ -1178,6 +1221,190 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }
     }
 
+    z3::expr v2sym(const Value* v)
+    {
+        if (auto it = m_v2sym.find(v); it != m_v2sym.end())
+            return it->second.value();
+
+        auto lconst = dyn_cast<ConstantInt>(v);
+        MKINT_CHECK_ABORT(nullptr != lconst) << "unsupported value -> symbol mapping: " << *v;
+        return m_solver.value().ctx().bv_val(lconst->getZExtValue(), lconst->getType()->getIntegerBitWidth());
+    }
+
+    void smt_solving(Module& M)
+    {
+        for (auto F : m_taint_funcs) {
+            if (F->isDeclaration())
+                continue;
+
+            // Get a path tree.
+            for (auto& bb : F->getBasicBlockList()) {
+                for (const auto& pred : predecessors(&bb)) {
+                    if (m_backedges[&bb].contains(pred) || &bb == pred)
+                        continue;
+
+                    m_bbpaths[pred].push_back(&bb);
+                }
+            }
+        }
+
+        // solve constraints.
+        for (auto F : m_taint_funcs) {
+            if (F->isDeclaration())
+                continue;
+
+            m_solver.value().push();
+            // add function arg constraints.
+            for (auto& arg : F->args()) {
+                if (!arg.getType()->isIntegerTy())
+                    continue;
+                const auto arg_name = F->getName() + "." + std::to_string(arg.getArgNo());
+                const auto argv
+                    = m_solver.value().ctx().bv_const(arg_name.str().c_str(), arg.getType()->getIntegerBitWidth());
+                add_range_cons(get_range_by_bb(&arg, &(F->getEntryBlock())), argv);
+            }
+
+            path_solving(&(F->getEntryBlock()), nullptr);
+            m_solver.value().pop();
+        }
+    }
+
+    void path_solving(BasicBlock* cur, BasicBlock* pred)
+    {
+        if (m_backedges[cur].contains(pred))
+            return;
+
+        auto cur_brng = m_func2range_info[cur->getParent()][cur];
+
+        if (nullptr != pred) {
+            if (auto terminator = pred->getTerminator(); auto br = dyn_cast<BranchInst>(terminator)) {
+                if (br->isConditional()) {
+                    if (auto cmp = dyn_cast<ICmpInst>(br->getCondition())) {
+                        // br: a op b == true or false
+                        // makeAllowedICmpRegion turning a op b into a range.
+                        auto lhs = cmp->getOperand(0);
+                        auto rhs = cmp->getOperand(1);
+
+                        if (!lhs->getType()->isIntegerTy() || !rhs->getType()->isIntegerTy()) {
+                            // This should be covered by `ICmpInst`.
+                            MKINT_WARN() << "The br operands are not both integers: " << *cmp;
+                        } else {
+                            bool is_true_br = br->getSuccessor(0) == cur;
+
+                            if (m_impossible_branches.count(cmp) && m_impossible_branches[cmp] == is_true_br) {
+                                return;
+                            }
+
+                            const auto get_tbr_assert = [lhs, rhs, cmp, this]() {
+                                switch (cmp->getPredicate()) {
+                                case ICmpInst::ICMP_EQ: // =
+                                    return v2sym(lhs) == v2sym(rhs);
+                                case ICmpInst::ICMP_NE: // !=
+                                    return v2sym(lhs) != v2sym(rhs);
+                                case ICmpInst::ICMP_SGT: // singed >
+                                    return z3::sgt(v2sym(lhs), v2sym(rhs));
+                                case ICmpInst::ICMP_SGE: // singed >=
+                                    return z3::sge(v2sym(lhs), v2sym(rhs));
+                                case ICmpInst::ICMP_SLT: // singed <
+                                    return z3::slt(v2sym(lhs), v2sym(rhs));
+                                case ICmpInst::ICMP_SLE: // singed <=
+                                    return z3::sle(v2sym(lhs), v2sym(rhs));
+                                case ICmpInst::ICMP_UGT: // unsigned >
+                                    return z3::ugt(v2sym(lhs), v2sym(rhs));
+                                case ICmpInst::ICMP_UGE: // unsigned >=
+                                    return z3::uge(v2sym(lhs), v2sym(rhs));
+                                case ICmpInst::ICMP_ULT: // unsigned <
+                                    return z3::ult(v2sym(lhs), v2sym(rhs));
+                                case ICmpInst::ICMP_ULE: // unsigned <=
+                                    return z3::ule(v2sym(lhs), v2sym(rhs));
+                                default:
+                                    break;
+                                }
+
+                                MKINT_CHECK_ABORT(false) << "unsupported icmp predicate: " << *cmp;
+                            };
+
+                            const auto check = [cmp, is_true_br, this] {
+                                if (m_solver.value().check() == z3::unsat) { // counter example
+                                    MKINT_WARN() << "[SMT Solving] Found dead branch in " << *cmp << ": " << is_true_br;
+                                    m_impossible_branches[cmp] = is_true_br;
+                                    return false;
+                                }
+                                return true;
+                            };
+
+                            if (is_true_br) { // T branch
+                                m_solver.value().add(get_tbr_assert());
+                                if (!check())
+                                    return;
+                                m_v2sym[cmp] = m_solver.value().ctx().bv_val(true, 1);
+                            } else { // F branch
+                                m_solver.value().add(!get_tbr_assert());
+                                if (!check())
+                                    return;
+                                m_v2sym[cmp] = m_solver.value().ctx().bv_val(false, 1);
+                            }
+                        }
+                    }
+                }
+            } else if (auto swt = dyn_cast<SwitchInst>(terminator)) {
+                auto cond = swt->getCondition();
+                if (cond->getType()->isIntegerTy()) {
+                    auto cond_rng = get_range_by_bb(cond, pred);
+                    auto emp_rng = crange::getEmpty(cond->getType()->getIntegerBitWidth());
+
+                    if (swt->getDefaultDest() == cur) { // default
+                        // not (all)
+                        for (auto c : swt->cases()) {
+                            auto case_val = c.getCaseValue();
+                            m_solver.value().add(v2sym(cond)
+                                != m_solver.value().ctx().bv_val(
+                                    case_val->getZExtValue(), cond->getType()->getIntegerBitWidth()));
+                        }
+                    } else {
+                        for (auto c : swt->cases()) {
+                            if (c.getCaseSuccessor() == cur) {
+                                auto case_val = c.getCaseValue();
+                                m_solver.value().add(v2sym(cond)
+                                    == m_solver.value().ctx().bv_val(
+                                        case_val->getZExtValue(), cond->getType()->getIntegerBitWidth()));
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else {
+                // try catch... (thank god, C does not have try-catch)
+                // indirectbr... ?
+                MKINT_CHECK_ABORT(false) << "Unknown terminator: " << *pred->getTerminator();
+            }
+        }
+
+        for (auto& inst : cur->getInstList()) {
+            if (!cur_brng.count(&inst))
+                continue;
+
+            if (auto op = dyn_cast<BinaryOperator>(&inst)) {
+                binary_check(op);
+                m_v2sym[op] = binary_op_propagate(op);
+                add_range_cons(get_range_by_bb(&inst, inst.getParent()), v2sym(op));
+            } else if (auto op = dyn_cast<CastInst>(&inst)) {
+                m_v2sym[op] = cast_op_propagate(op);
+                add_range_cons(get_range_by_bb(&inst, inst.getParent()), v2sym(op));
+            } else {
+                const auto name = "\%vid" + std::to_string(inst.getValueID());
+                m_v2sym[&inst] = m_solver.value().ctx().bv_const(name.c_str(), inst.getType()->getIntegerBitWidth());
+                add_range_cons(get_range_by_bb(&inst, inst.getParent()), v2sym(&inst));
+            }
+        }
+
+        for (auto succ : m_bbpaths[cur]) {
+            m_solver.value().push();
+            path_solving(cur, succ);
+            m_solver.value().pop();
+        }
+    }
+
 private:
     MapVector<Function*, std::vector<CallInst*>> m_func2tsrc;
     SetVector<Function*> m_taint_funcs;
@@ -1197,6 +1424,11 @@ private:
     std::set<Instruction*> m_overflow_insts;
     std::set<Instruction*> m_bad_shift_insts;
     std::set<Instruction*> m_div_zero_insts;
+
+    // constraint solving
+    std::optional<z3::solver> m_solver;
+    DenseMap<const Value*, std::optional<z3::expr>> m_v2sym;
+    std::map<const BasicBlock*, SmallVector<BasicBlock*, 2>> m_bbpaths;
 };
 } // namespace
 
