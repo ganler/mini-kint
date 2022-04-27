@@ -1,6 +1,7 @@
 #include "log.hpp"
 #include "rang.hpp"
 
+#include <cctype>
 #include <cxxabi.h>
 
 #include <llvm/ADT/APInt.h>
@@ -28,8 +29,10 @@
 #include <llvm/Passes/PassPlugin.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
 
+#include <stdexcept>
 #include <z3++.h>
 
 #include <array>
@@ -107,8 +110,14 @@ int64_t get_id(Instruction* inst)
     llvm::raw_string_ostream rso(str);
     inst->print(rso);
     auto inst_str = StringRef(rso.str());
-    auto ids = inst_str.trim().split(' ').first.substr(1);
-    return std::stoi(ids.str());
+    auto ids = inst_str.trim().split(' ').first;
+    size_t v = 0;
+    for (auto c : ids) {
+        if (!std::isdigit(c))
+            continue;
+        v = v * 10 + c - '0';
+    }
+    return v;
 }
 
 namespace {
@@ -301,7 +310,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
             if (auto gv = dyn_cast<GlobalVariable>(var))
                 return m_global2range[gv];
         }
-        MKINT_CHECK_ABORT(false) << "Unknown operand type: " << *var;
+        MKINT_WARN() << "Unknown operand type: " << *var;
     }
 
     crange get_range_by_bb(const Value* var, const BasicBlock* bb)
@@ -1448,6 +1457,7 @@ extern "C" ::llvm::PassPluginLibraryInfo LLVM_ATTRIBUTE_WEAK llvmGetPassPluginIn
                         if (Name == "mkint-pass") {
                             // do mem2reg.
                             MPM.addPass(createModuleToFunctionPassAdaptor(PromotePass()));
+                            MPM.addPass(createModuleToFunctionPassAdaptor(SROAPass()));
                             MPM.addPass(MKintPass());
                             return true;
                         }
