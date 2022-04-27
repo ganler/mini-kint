@@ -406,7 +406,10 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 new_range = get_rng(tval).unionWith(get_rng(fval));
             } else if (const CastInst* op = dyn_cast<CastInst>(&inst)) {
                 new_range = [op, &get_rng]() -> crange {
-                    auto inprng = get_rng(op->getOperand(0));
+                    auto inp = op->getOperand(0);
+                    if (!inp->getType()->isIntegerTy())
+                        return crange(op->getType()->getIntegerBitWidth(), true);
+                    auto inprng = get_rng(inp);
                     const uint32_t bits = op->getType()->getIntegerBitWidth();
                     switch (op->getOpcode()) {
                     case CastInst::Trunc:
