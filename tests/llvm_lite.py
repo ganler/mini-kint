@@ -34,6 +34,7 @@ class TestMKint(unittest.TestCase):
         m.verify()
 
     def test_i_annoted(self):
+        print(f'== {TestMKint.AFTER_FILE}')
         # m = llvm.parse_assembly(TestMKint.BEFORE_IR)
         # err_to_find = {}
         # for f in m.functions:
@@ -69,7 +70,7 @@ class TestMKint(unittest.TestCase):
         ERR_FN = None
         m = llvm.parse_assembly(TestMKint.AFTER_IR)
 
-        print(f"+++++ m: {m}")
+        # print(f"+++++ m: {m}")
 
         for f in m.functions:
             # print(f'Function: {f.name}/`{f.type}`')

@@ -1,4 +1,12 @@
 // http://git.kernel.org/linus/a1f74ae82d133ebb2aabb19d181944b4e83e9960
+// mpt2sas-2011-1494
+
+// RUN: clang-14 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o %t.ll
+// RUN: opt-14 -load-pass-plugin=%builddir/mkint/MiniKintPass.so -passes=mkint-pass -S %t.ll -o %t.out.ll
+
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
+
 
 #include "linux.h"
 
@@ -12,7 +20,7 @@ struct mpt2_ioctl_command {
 
 enum block_state { NON_BLOCKING, BLOCKING };
 
-long _ctl_do_mpt_command(struct MPT2SAS_ADAPTER *ioc,
+long sys__ctl_do_mpt_command(struct MPT2SAS_ADAPTER *ioc,
 			 struct mpt2_ioctl_command karg, void __user *mf, enum block_state state)
 {
 	void *mpi_request = NULL;

@@ -1,4 +1,12 @@
 // http://git.kernel.org/linus/2ebc3464781ad24474abcbd2274e6254689853b5
+// btrfs-2010-2538
+
+// RUN: clang-14 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o %t.ll
+// RUN: opt-14 -load-pass-plugin=%builddir/mkint/MiniKintPass.so -passes=mkint-pass -S %t.ll -o %t.out.ll
+
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
+
 
 #include "linux.h"
 
@@ -10,7 +18,7 @@ struct inode {
 
 void btrfs_lookup_first_ordered_extent(struct inode * inode, u64 file_offset);
 
-long btrfs_ioctl_clone(struct inode *src, u64 s_blocksize,
+long sys_btrfs_ioctl_clone(struct inode *src, u64 s_blocksize,
 		       u64 off, u64 olen)
 {
 	u64 len = olen;

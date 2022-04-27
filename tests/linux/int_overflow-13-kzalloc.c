@@ -1,4 +1,12 @@
 // http://git.kernel.org/linus/5591bf07225523600450edd9e6ad258bb877b779
+// snd-2010-3442
+
+// RUN: clang-14 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o %t.ll
+// RUN: opt-14 -load-pass-plugin=%builddir/mkint/MiniKintPass.so -passes=mkint-pass -S %t.ll -o %t.out.ll
+
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
+
 
 #include "linux.h"
 
@@ -13,7 +21,7 @@ struct snd_kcontrol_volatile {
 	unsigned int access;
 };
 
-struct snd_kcontrol *snd_ctl_new(struct snd_kcontrol *control,
+struct sys_snd_kcontrol *snd_ctl_new(struct snd_kcontrol *control,
 				 unsigned int access)
 {
 	struct snd_kcontrol *kctl;

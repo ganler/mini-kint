@@ -45,7 +45,7 @@ int read_n(int fd, void *buf, size_t len);
 
 gint lock_path (const gchar *path, guint32 *lockid);
 
-int main()
+int sys_main()
 {
 	struct _CamelLockHelperMsg msg;
 	gint len;
