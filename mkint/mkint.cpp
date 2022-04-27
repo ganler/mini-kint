@@ -1022,8 +1022,8 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         z3::solver s(ctx);
 
         // create a int symbol
-        z3::expr lhs_iv = ctx.int_const("lhs");
-        z3::expr rhs_iv = ctx.int_const("rhs");
+        z3::expr lhs_bv = ctx.bv_const("lhs", lhs.getBitWidth());
+        z3::expr rhs_bv = ctx.bv_const("rhs", lhs.getBitWidth());
 
         const auto [is_nsw, is_nuw] = [op] {
             if (const auto ofop = dyn_cast<OverflowingBinaryOperator>(op)) {
@@ -1033,39 +1033,37 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }();
 
         const auto add_signed_cons = [&] {
-            s.add(lhs_iv <= ctx.int_val(lhs.getSignedMax().getSExtValue()));
-            s.add(lhs_iv >= ctx.int_val(lhs.getSignedMin().getSExtValue()));
-            s.add(rhs_iv <= ctx.int_val(rhs.getSignedMax().getSExtValue()));
-            s.add(rhs_iv >= ctx.int_val(rhs.getSignedMin().getSExtValue()));
+            s.add(z3::sle(lhs_bv, ctx.bv_val(lhs.getSignedMax().getSExtValue(), lhs.getBitWidth())));
+            s.add(z3::sge(lhs_bv, ctx.bv_val(lhs.getSignedMin().getSExtValue(), lhs.getBitWidth())));
+            s.add(z3::sle(rhs_bv, ctx.bv_val(rhs.getSignedMax().getSExtValue(), lhs.getBitWidth())));
+            s.add(z3::sge(rhs_bv, ctx.bv_val(rhs.getSignedMin().getSExtValue(), lhs.getBitWidth())));
         };
 
         const auto add_unsigned_cons = [&] {
-            s.add(lhs_iv <= ctx.int_val(lhs.getUnsignedMax().getZExtValue()));
-            s.add(lhs_iv >= ctx.int_val(lhs.getUnsignedMin().getZExtValue()));
-            s.add(rhs_iv <= ctx.int_val(rhs.getUnsignedMax().getZExtValue()));
-            s.add(rhs_iv >= ctx.int_val(rhs.getUnsignedMin().getZExtValue()));
+            s.add(z3::ule(lhs_bv, ctx.bv_val(lhs.getUnsignedMax().getZExtValue(), lhs.getBitWidth())));
+            s.add(z3::uge(lhs_bv, ctx.bv_val(lhs.getUnsignedMin().getZExtValue(), lhs.getBitWidth())));
+            s.add(z3::ule(rhs_bv, ctx.bv_val(rhs.getUnsignedMax().getZExtValue(), lhs.getBitWidth())));
+            s.add(z3::uge(rhs_bv, ctx.bv_val(rhs.getUnsignedMin().getZExtValue(), lhs.getBitWidth())));
         };
 
-        const auto may_signed_overflow = [&](z3::expr result, size_t nbit) {
-            int64_t smin = APInt::getSignedMinValue(nbit).getSExtValue();
-            int64_t smax = APInt::getSignedMaxValue(nbit).getSExtValue();
-            return result < ctx.int_val(smin) || result > ctx.int_val(smax);
-        };
-
-        const auto may_unsigned_overflow = [&](z3::expr result, size_t nbit) {
-            uint64_t umin = APInt::getMinValue(nbit).getZExtValue();
-            uint64_t umax = APInt::getMaxValue(nbit).getZExtValue();
-            return result < ctx.int_val(umin) || result > ctx.int_val(umax);
-        };
-
-        const auto check = [&](interr et) {
+        const auto check = [&](interr et, bool is_signed) {
             if (s.check() == z3::sat) { // counter example
                 z3::model m = s.get_model();
                 MKINT_WARN() << rang::fg::yellow << rang::style::bold << mkstr(et) << rang::style::reset << " at "
                              << rang::bg::black << rang::fg::red << op->getParent()->getParent()->getName()
                              << "::" << *op << rang::style::reset;
-                MKINT_WARN() << "Counter example: " << rang::bg::black << rang::fg::red << op->getOpcodeName() << '('
-                             << m.eval(lhs_iv, true) << ", " << m.eval(rhs_iv, true) << ')' << rang::style::reset;
+                auto lhs_bin = m.eval(lhs_bv, true);
+                auto rhs_bin = m.eval(rhs_bv, true);
+                if (is_signed) {
+                    MKINT_WARN() << "Counter example: " << rang::bg::black << rang::fg::red << op->getOpcodeName()
+                                 << '(' << lhs_bin << ", " << rhs_bin << ") -> " << op->getOpcodeName() << '('
+                                 << lhs_bin.as_int64() << ", " << rhs_bin.as_int64() << ')' << rang::style::reset;
+                } else {
+                    MKINT_WARN() << "Counter example: " << rang::bg::black << rang::fg::red << op->getOpcodeName()
+                                 << '(' << lhs_bin << ", " << rhs_bin << ") -> " << op->getOpcodeName() << '('
+                                 << lhs_bin.as_uint64() << ", " << rhs_bin.as_uint64() << ')' << rang::style::reset;
+                }
+
                 switch (et) {
                 case interr::OVERFLOW:
                     m_overflow_insts.insert(op);
@@ -1086,63 +1084,69 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         case Instruction::Add:
             if (!is_nsw) { // unsigned
                 add_unsigned_cons();
-                s.add(may_unsigned_overflow(lhs_iv + rhs_iv, op->getType()->getIntegerBitWidth()));
+                s.add(!z3 ::bvadd_no_overflow(lhs_bv, rhs_bv, false));
+                check(interr::OVERFLOW, false);
             } else {
                 add_signed_cons();
-                s.add(may_signed_overflow(lhs_iv + rhs_iv, op->getType()->getIntegerBitWidth()));
+                s.add(!z3::bvadd_no_overflow(lhs_bv, rhs_bv, true));
+                s.add(!z3::bvadd_no_underflow(lhs_bv, rhs_bv));
+                check(interr::OVERFLOW, true);
             }
 
-            check(interr::OVERFLOW);
             break;
         case Instruction::Sub:
             if (!is_nsw) {
                 add_unsigned_cons();
-                s.add(may_unsigned_overflow(lhs_iv - rhs_iv, op->getType()->getIntegerBitWidth()));
+                s.add(!z3::bvsub_no_underflow(lhs_bv, rhs_bv, false));
+                check(interr::OVERFLOW, false);
             } else {
                 add_signed_cons();
-                s.add(may_signed_overflow(lhs_iv - rhs_iv, op->getType()->getIntegerBitWidth()));
+                s.add(!z3::bvsub_no_underflow(lhs_bv, rhs_bv, true));
+                s.add(!z3::bvsub_no_overflow(lhs_bv, rhs_bv));
+                check(interr::OVERFLOW, true);
             }
 
-            check(interr::OVERFLOW);
             break;
         case Instruction::Mul:
             if (!is_nsw) {
                 add_unsigned_cons();
-                s.add(may_unsigned_overflow(lhs_iv * rhs_iv, op->getType()->getIntegerBitWidth()));
+                s.add(!z3::bvmul_no_overflow(lhs_bv, rhs_bv, false));
+                check(interr::OVERFLOW, false);
             } else {
                 add_signed_cons();
-                s.add(may_signed_overflow(lhs_iv * rhs_iv, op->getType()->getIntegerBitWidth()));
+                s.add(!z3::bvmul_no_overflow(lhs_bv, rhs_bv, true));
+                s.add(!z3::bvmul_no_underflow(lhs_bv, rhs_bv)); // INTMAX * -1
+                check(interr::OVERFLOW, true);
             }
-
-            check(interr::OVERFLOW);
             break;
         case Instruction::URem:
         case Instruction::UDiv:
             add_unsigned_cons();
-            s.add(rhs_iv == 0);
-            check(interr::DIV_BY_ZERO);
+            s.add(rhs_bv == ctx.bv_val(0, rhs.getBitWidth()));
+            check(interr::DIV_BY_ZERO, false);
             break;
         case Instruction::SRem:
         case Instruction::SDiv: // can be overflow or divisor == 0
             add_signed_cons();
             s.push();
-            s.add(rhs_iv == 0); // may 0?
-            check(interr::DIV_BY_ZERO);
+            s.add(rhs_bv == ctx.bv_val(0, rhs.getBitWidth())); // may 0?
+            check(interr::DIV_BY_ZERO, true);
             s.pop();
-            s.add(may_signed_overflow(lhs_iv / rhs_iv, op->getType()->getIntegerBitWidth()));
-            check(interr::OVERFLOW);
+            s.add(z3::bvsdiv_no_overflow(lhs_bv, rhs_bv));
+            check(interr::OVERFLOW, true);
             break;
         case Instruction::Shl:
         case Instruction::LShr:
         case Instruction::AShr:
-            s.add(rhs_iv <= ctx.int_val(rhs.getUnsignedMax().getZExtValue()));
-            s.add(rhs_iv >= ctx.int_val(rhs.getUnsignedMin().getZExtValue()));
-            s.add(rhs_iv >= ctx.int_val(rhs.getBitWidth())); // sat means bug
-            check(interr::BAD_SHIFT);
+            s.add(rhs_bv <= ctx.bv_val(rhs.getSignedMax().getZExtValue(), rhs.getBitWidth()));
+            s.add(rhs_bv >= ctx.bv_val(rhs.getSignedMin().getZExtValue(), rhs.getBitWidth()));
+            s.add(rhs_bv >= ctx.bv_val(rhs.getBitWidth(), rhs.getBitWidth())); // sat means bug
+            check(interr::BAD_SHIFT, false);
             break;
         case Instruction::And:
         case Instruction::Or:
         case Instruction::Xor:
+            break;
         default:
             break;
         }
