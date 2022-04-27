@@ -1278,6 +1278,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 const auto arg_name = F->getName() + "." + std::to_string(arg.getArgNo());
                 const auto argv
                     = m_solver.value().ctx().bv_const(arg_name.str().c_str(), arg.getType()->getIntegerBitWidth());
+                m_v2sym[&arg] = argv;
                 add_range_cons(get_range_by_bb(&arg, &(F->getEntryBlock())), argv);
             }
 
