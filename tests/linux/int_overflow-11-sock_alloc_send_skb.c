@@ -1,4 +1,12 @@
 // http://git.kernel.org/linus/83e0bbcbe2145f160fbaa109b0439dae7f4a38a9
+// rose-2009-1265
+
+// RUN: clang-14 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o %t.ll
+// RUN: opt-14 -load-pass-plugin=%builddir/mkint/MiniKintPass.so -passes=mkint-pass -S %t.ll -o %t.out.ll
+
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
+
 
 #include "linux.h"
 
@@ -26,7 +34,7 @@ struct msghdr {
 	unsigned int	msg_flags;
 };
 
-int rose_sendmsg(struct kiocb *iocb, struct socket *sock,
+int sys_rose_sendmsg(struct kiocb *iocb, struct socket *sock,
 		 struct msghdr *msg, size_t len)
 {
 	struct sock *sk = sock->sk;

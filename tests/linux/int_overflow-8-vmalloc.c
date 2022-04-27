@@ -1,4 +1,12 @@
 // http://git.kernel.org/linus/6a54435560efdab1a08f429a954df4d6c740bddf
+// kvm-2009-3638
+
+// RUN: clang-14 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o %t.ll
+// RUN: opt-14 -load-pass-plugin=%builddir/mkint/MiniKintPass.so -passes=mkint-pass -S %t.ll -o %t.out.ll
+
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
+
 
 #include "linux.h"
 
@@ -12,7 +20,7 @@ struct kvm_cpuid_entry2 {
 	u32 data[10];
 };
 
-int kvm_dev_ioctl_get_supported_cpuid(struct kvm_cpuid2 *cpuid,
+int sys_kvm_dev_ioctl_get_supported_cpuid(struct kvm_cpuid2 *cpuid,
                                       struct kvm_cpuid_entry2 *entries)
 {
 	int r;

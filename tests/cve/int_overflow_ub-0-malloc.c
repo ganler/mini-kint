@@ -30,7 +30,7 @@ struct pam {
 	int width;
 };
 
-void readpgm(pix *p, struct pam *inpam)
+void sys_readpgm(pix *p, struct pam *inpam)
 {
 	p->x = inpam->width;
 	p->y = inpam->height;

@@ -1,11 +1,10 @@
+// http://git.kernel.org/linus/44ab8cc56c45ca781371a4a77f35da19cf5db028
+
 // RUN: clang-14 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o %t.ll
 // RUN: opt-14 -load-pass-plugin=%builddir/mkint/MiniKintPass.so -passes=mkint-pass -S %t.ll -o %t.out.ll
 
 // RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
 // RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
-
-
-// http://git.kernel.org/linus/44ab8cc56c45ca781371a4a77f35da19cf5db028
 
 #define DP_TRAIN_PRE_EMPHASIS_9_5	(3 << 3)
 #define DP_TRAIN_VOLTAGE_SWING_1200	(3 << 0)

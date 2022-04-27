@@ -1,4 +1,12 @@
 // http://git.kernel.org/linus/dc6b845044ccb7e9e6f3b7e71bd179b3cf0223b6
+// si4713-2011-2700
+
+// RUN: clang-14 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o %t.ll
+// RUN: opt-14 -load-pass-plugin=%builddir/mkint/MiniKintPass.so -passes=mkint-pass -S %t.ll -o %t.out.ll
+
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
+
 
 #include "linux.h"
 
@@ -27,7 +35,7 @@ int si4713_set_rds_ps_name(struct si4713_device *sdev, char *ps_name);
 
 int si4713_set_rds_radio_text(struct si4713_device *sdev, char *rt);
 
-int si4713_write_econtrol_string(struct si4713_device *sdev,
+int sys_si4713_write_econtrol_string(struct si4713_device *sdev,
 				 struct v4l2_ext_control *control)
 {
 	int len;

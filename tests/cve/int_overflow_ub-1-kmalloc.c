@@ -19,7 +19,7 @@ struct sctp_sock {
 	struct sctp_endpoint *ep;
 };
 
-int sctp_setsockopt(struct sock *sk, char *optval, int optlen)
+int sys_sctp_setsockopt(struct sock *sk, char *optval, int optlen)
 {
 	char *tmp;
 

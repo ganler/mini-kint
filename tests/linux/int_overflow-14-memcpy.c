@@ -1,4 +1,12 @@
 // http://git.kernel.org/linus/b52a360b2aa1c59ba9970fb0f52bbb093fcc7a24
+// xfs-2011-4077
+
+// RUN: clang-14 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o %t.ll
+// RUN: opt-14 -load-pass-plugin=%builddir/mkint/MiniKintPass.so -passes=mkint-pass -S %t.ll -o %t.out.ll
+
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
+
 
 #include "linux.h"
 
@@ -32,7 +40,7 @@ void xfs_iunlock(xfs_inode_t *, uint);
 int xfs_readlink_bmap(xfs_inode_t *, char *);
 
 int
-xfs_readlink(
+sys_xfs_readlink(
 	xfs_inode_t     *ip,
 	char		*link)
 {

@@ -1,4 +1,12 @@
 // http://git.kernel.org/linus/252a52aa4fa22a668f019e55b3aac3ff71ec1c29
+// pktcdvd-2010-3437
+
+// RUN: clang-14 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o %t.ll
+// RUN: opt-14 -load-pass-plugin=%builddir/mkint/MiniKintPass.so -passes=mkint-pass -S %t.ll -o %t.out.ll
+
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
+
 
 #include "linux.h"
 
@@ -35,7 +43,7 @@ static struct pktcdvd_device *pkt_find_dev_from_minor(unsigned int dev_minor)
 	return pkt_devs[dev_minor]; // exp: {{array}}
 }
 
-void pkt_get_status(struct pkt_ctrl_command *ctrl_cmd)
+void sys_pkt_get_status(struct pkt_ctrl_command *ctrl_cmd)
 {
 	struct pktcdvd_device *pd;
 

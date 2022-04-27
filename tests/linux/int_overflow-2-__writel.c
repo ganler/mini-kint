@@ -1,4 +1,12 @@
 // http://git.kernel.org/linus/194b3da873fd334ef183806db751473512af29ce
+// agp-2011-2022
+
+// RUN: clang-14 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o %t.ll
+// RUN: opt-14 -load-pass-plugin=%builddir/mkint/MiniKintPass.so -passes=mkint-pass -S %t.ll -o %t.out.ll
+
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
+
 
 #include "linux.h"
 
@@ -11,7 +19,7 @@ int __agp_type_to_mask_type(int);
 void __writel(size_t);
 int agp_num_entries(void);
 
-int agp_generic_remove_memory(struct agp_memory *mem, off_t pg_start, int type)
+int sys_agp_generic_remove_memory(struct agp_memory *mem, off_t pg_start, int type)
 {
 	size_t i;
 	int mask_type, num_entries = __get_num_entries();

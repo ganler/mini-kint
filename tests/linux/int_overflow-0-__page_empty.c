@@ -1,4 +1,12 @@
 // http://git.kernel.org/linus/194b3da873fd334ef183806db751473512af29ce
+// agp-2011-1745
+
+// RUN: clang-14 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o %t.ll
+// RUN: opt-14 -load-pass-plugin=%builddir/mkint/MiniKintPass.so -passes=mkint-pass -S %t.ll -o %t.out.ll
+
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
+
 
 #include "linux.h"
 
@@ -9,7 +17,7 @@ struct agp_memory {
 int __get_num_entries(void);
 int __page_empty(off_t);
 
-int agp_generic_insert_memory(struct agp_memory * mem, off_t pg_start)
+int sys_agp_generic_insert_memory(struct agp_memory * mem, off_t pg_start)
 {
 	int num_entries = __get_num_entries();
 	off_t j;
