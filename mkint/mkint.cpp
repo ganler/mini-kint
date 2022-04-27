@@ -1407,7 +1407,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }
 
         for (auto& inst : cur->getInstList()) {
-            if (!cur_brng.count(&inst))
+            if (!cur_brng.count(&inst) || !inst.getType()->isIntegerTy())
                 continue;
 
             if (auto op = dyn_cast<BinaryOperator>(&inst)) {
