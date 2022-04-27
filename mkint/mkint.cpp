@@ -1199,7 +1199,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         const uint32_t bits = op->getType()->getIntegerBitWidth();
         switch (op->getOpcode()) {
         case CastInst::Trunc:
-            return src.extract(bits, 0);
+            return src.extract(bits - 1, 0);
         case CastInst::ZExt:
             return z3::zext(src, bits - op->getOperand(0)->getType()->getIntegerBitWidth());
         case CastInst::SExt:
