@@ -4,14 +4,7 @@
 // RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
 // RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
 
-#include <stdlib.h>
 #include <stdint.h>
+#include <stdlib.h>
 
-
-#define SHIFT_NEGATIVE -1
-
-void* sys_shift(size_t n)
-{
-	return malloc(n << SHIFT_NEGATIVE);
-}
-
+void* sys_shift(size_t n) { return malloc(n << -1); }

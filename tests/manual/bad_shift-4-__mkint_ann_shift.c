@@ -4,11 +4,7 @@
 // RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
 // RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
 
+#include <stdint.h>
+#include <stdlib.h>
 
-#include "linux.h"
-
-void* __mkint_ann_shift(u32 n)
-{
-	return malloc(n >> sizeof(u32) * 8); 
-}
-
+void* __mkint_ann_shift(uint32_t n) { return malloc(n >> sizeof(uint32_t) * 8); }

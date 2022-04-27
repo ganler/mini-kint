@@ -4,12 +4,12 @@
 // RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
 // RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
 
-#include <stdlib.h>
 #include <stdint.h>
+#include <stdlib.h>
 
-void *sys_malloc_array(size_t n, size_t size)
+void* sys_malloc_array(size_t n, size_t size)
 {
-	if (size && n > SIZE_MAX / size)
-		return NULL;
-	return malloc(n * size);
+    if (size && n > SIZE_MAX / size)
+        return NULL;
+    return malloc(n * size);
 }

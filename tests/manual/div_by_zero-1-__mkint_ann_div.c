@@ -4,16 +4,7 @@
 // RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
 // RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
 
+#include <stdint.h>
+#include <stdlib.h>
 
-
-#include "linux.h"
-
-
-#define ZERO 0
-#define ONE 1
-#define TWO 2
-
-void* __mkint_ann_div(u32 n, u8 d)
-{
-	return malloc(n / (d & 0)); 
-}
+void* __mkint_ann_div(uint32_t n, uint8_t d) { return malloc(n / (d & 0)); }

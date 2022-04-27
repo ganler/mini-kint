@@ -4,12 +4,9 @@
 // RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
 // RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
 
+#include <stdint.h>
+#include <stdlib.h>
 
-#include "linux.h"
+uint32_t arr[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
 
-u32 arr[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-
-u32 sys_idx(u32 n) 
-{
-    return arr[n];
-}
+uint32_t sys_idx(uint32_t n) { return arr[n]; }
