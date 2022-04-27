@@ -945,25 +945,29 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
                 }
             } else if (GV.getValueType()->isArrayTy()) { // int array.
                 const auto garr = dyn_cast<ArrayType>(GV.getValueType());
-                if (GV.hasInitializer()) {
-                    if (auto darr = dyn_cast<ConstantDataArray>(GV.getInitializer())) {
-                        for (size_t i = 0; i < darr->getNumElements(); i++) {
-                            auto init_val = dyn_cast<ConstantInt>(darr->getElementAsConstant(i))->getValue();
-                            MKINT_LOG() << GV.getName() << "[" << i << "] init by " << init_val;
-                            m_garr2ranges[&GV].push_back(crange(init_val));
+                if (garr->getElementType()->isIntegerTy()) {
+                    if (GV.hasInitializer()) {
+                        if (auto darr = dyn_cast<ConstantDataArray>(GV.getInitializer())) {
+                            for (size_t i = 0; i < darr->getNumElements(); i++) {
+                                auto init_val = dyn_cast<ConstantInt>(darr->getElementAsConstant(i))->getValue();
+                                MKINT_LOG() << GV.getName() << "[" << i << "] init by " << init_val;
+                                m_garr2ranges[&GV].push_back(crange(init_val));
+                            }
+                        } else if (auto zinit = dyn_cast<ConstantAggregateZero>(GV.getInitializer())) {
+                            for (size_t i = 0; i < zinit->getElementCount().getFixedValue(); i++)
+                                m_garr2ranges[&GV].push_back(crange(
+                                    APInt::getNullValue(zinit->getElementValue(i)->getType()->getIntegerBitWidth())));
+                        } else {
+                            MKINT_CHECK_ABORT(false) << "Unsupported initializer for global array: " << GV.getName();
                         }
-                    } else if (auto zinit = dyn_cast<ConstantAggregateZero>(GV.getInitializer())) {
-                        for (size_t i = 0; i < zinit->getElementCount().getFixedValue(); i++)
-                            m_garr2ranges[&GV].push_back(crange(
-                                APInt::getNullValue(zinit->getElementValue(i)->getType()->getIntegerBitWidth())));
                     } else {
-                        MKINT_CHECK_ABORT(false) << "Unsupported initializer for global array: " << GV.getName();
+                        for (size_t i = 0; i < garr->getNumElements(); i++) {
+                            m_garr2ranges[&GV].push_back( // can be anything
+                                crange(garr->getElementType()->getIntegerBitWidth(), true));
+                        }
                     }
                 } else {
-                    for (size_t i = 0; i < garr->getNumElements(); i++) {
-                        m_garr2ranges[&GV].push_back( // can be anything
-                            crange(garr->getElementType()->getIntegerBitWidth(), true));
-                    }
+                    MKINT_WARN() << "Unhandled global var type: " << *GV.getType() << " -> " << GV.getName();
                 }
             } else {
                 MKINT_WARN() << "Unhandled global var type: " << *GV.getType() << " -> " << GV.getName();
