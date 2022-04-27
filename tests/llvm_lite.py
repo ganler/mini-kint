@@ -16,7 +16,8 @@ ERR_NAME_MAP = {
     "bad_shift": "bad shift",
     "cmp_true": "impossible false branch",
     "cmp_false": "impossible true branch",
-    "div_by_zero": "divide by zero" 
+    "div_by_zero": "divide by zero",
+    "div_zero": "divide by zero"
 }
 
 class TestMKint(unittest.TestCase):
