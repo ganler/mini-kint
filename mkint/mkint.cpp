@@ -1,7 +1,6 @@
 #include "log.hpp"
 #include "rang.hpp"
 
-#include <cctype>
 #include <cxxabi.h>
 
 #include <llvm/ADT/APInt.h>
@@ -37,6 +36,7 @@
 
 #include <array>
 #include <cassert>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -682,7 +682,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         return false;
     }
 
-    bool taint_bcast_sink(const std::vector<CallInst*>& taint_source)
+    bool taint_bcast_sink(Function* f, const std::vector<CallInst*>& taint_source)
     {
         // ? Note we currently assume that sub-func-calls do not have sinks...
         // ? otherwise we need a use-def tree to do the job (but too complicated).
@@ -694,6 +694,18 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         //       we backtrack and mark taints.
 
         bool ret = false;
+
+        // try to broadcast all allocas.
+        for (auto& bb : *f) {
+            for (auto& inst : bb) {
+                if (auto alloc = dyn_cast<AllocaInst>(&inst)) {
+                    if (is_sink_reachable(alloc)) {
+                        mark_taint(*alloc, "source");
+                        ret = true;
+                    }
+                }
+            }
+        }
 
         for (auto ts : taint_source) {
             if (is_sink_reachable(ts)) {
@@ -797,7 +809,7 @@ struct MKintPass : public PassInfoMixin<MKintPass> {
         }
 
         for (auto [fp, tsrc] : m_func2tsrc) {
-            if (taint_bcast_sink(tsrc)) {
+            if (taint_bcast_sink(fp, tsrc)) {
                 m_taint_funcs.insert(fp);
             }
         }
