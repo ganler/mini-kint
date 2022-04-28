@@ -15,7 +15,7 @@
 #define MHSIZ		sizeof(struct bcm_msg_head)
 
 struct bcm_msg_head {
-	u32 nframes;
+	u64 nframes;
 };
 
 struct can_frame { char dummy[6]; };

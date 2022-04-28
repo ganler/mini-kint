@@ -25,15 +25,18 @@ typedef struct sf_private_tag
 	void				*vio_user_data ;
 } SF_PRIVATE ;
 
-size_t __mkint_sink0(void* ptr, size_t c, void* t);
+size_t __mkint_sink2(void* ptr, size_t c, void* t);
 
 size_t
 sys_psf_fwrite (const void *ptr, size_t bytes, size_t items, SF_PRIVATE *psf)
 {	
-    size_t total = 0 ;
+    size_t total = 0;
+
+	if (bytes && items > SIZE_MAX / bytes)
+        return NULL;
 
 	if (psf->virtual_io)
-		return __mkint_sink0(ptr, bytes*items, psf->virtual_io / bytes) ;
+		return __mkint_sink2(ptr, bytes*items, psf->virtual_io / bytes) ;
 
 	items *= bytes ;
 
