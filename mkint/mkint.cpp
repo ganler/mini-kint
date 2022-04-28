@@ -207,14 +207,14 @@ static std::vector<CallInst*> get_taint_source(Function& F)
         // Unfortunately arguments cannot be marked with metadata...
         // We need to rewrite the arguments -> unary callers and mark the callers.
         for (auto& arg : F.args()) {
-            auto itype = dyn_cast<IntegerType>(arg.getType());
-            if (nullptr == itype || arg.use_empty()) {
-                continue;
-            }
+            // auto itype = dyn_cast<IntegerType>(arg.getType());
+            // if (nullptr == itype || arg.use_empty())
+            //     continue;
+
             auto call_name = name.str() + MKINT_TAINT_SRC_SUFFX + std::to_string(arg.getArgNo());
             MKINT_LOG() << "Taint Analysis -> taint src arg -> call inst: " << call_name;
-            auto call_inst = CallInst::Create(F.getParent()->getOrInsertFunction(call_name, itype), arg.getName(),
-                &*F.getEntryBlock().getFirstInsertionPt());
+            auto call_inst = CallInst::Create(F.getParent()->getOrInsertFunction(call_name, arg.getType()),
+                arg.getName(), &*F.getEntryBlock().getFirstInsertionPt());
             ret.push_back(call_inst);
             arg.replaceAllUsesWith(call_inst);
         }
