@@ -174,7 +174,11 @@ std::string_view mkstr(interr err)
 template <interr err_t, typename I> static std::enable_if_t<std::is_pointer_v<I>> mark_err(I inst)
 {
     auto& ctx = inst->getContext();
-    auto md = MDNode::get(ctx, MDString::get(ctx, mkstr<err_t>()));
+    std::string prefix = "";
+    if (MDNode* omd = inst->getMetadata(MKINT_IR_ERR)) {
+        prefix = cast<MDString>(omd->getOperand(0))->getString().str() + " + ";
+    }
+    auto md = MDNode::get(ctx, MDString::get(ctx, prefix + mkstr<err_t>()));
     inst->setMetadata(MKINT_IR_ERR, md);
 }
 
