@@ -124,7 +124,7 @@ class TestMKint(unittest.TestCase):
             assert ERR_FN == None
         else:
             assert ERR != None
-            assert ERR in ERR_NAME_MAP[ERR_NAME]
+            assert ERR_NAME_MAP[ERR_NAME] in ERR 
             assert ERR_FN_NAME == ERR_FN
 
 if __name__ == '__main__':

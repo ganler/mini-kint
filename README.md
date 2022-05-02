@@ -10,6 +10,35 @@ mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=1
 ```
 
+## Run Test
+
+Run unit test and get raw output of LLVM-lit
+```shell
+cd build
+make check
+```
+
+Run unit test and get analysis of the test result
+```shell
+cd build
+make check &> test.log
+LOG=test.log python3 ../tests/statistics.py
+```
+
+Add your own test cases:
+
+Put your c code test file under `tests/manual` and add following comments in the header of the new test file to trigger automatic testing.
+
+```c
+// RUN: clang-14 -O0 -Xclang -disable-O0-optnone -emit-llvm -S %s -o %t.ll
+// RUN: opt-14 -load-pass-plugin=%builddir/mkint/MiniKintPass.so -passes=mkint-pass -S %t.ll -o %t.out.ll
+
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_IR_correct
+// RUN: BEFORE=%t.ll AFTER=%t.out.ll python3 %testdir/llvm_lite.py TestMKint.test_i_annoted
+```
+
+Then use the same commands used in running unit tests.
+
 ## Worklist
 
 - [x] (Basic::Logger) add logger library for debugging and checking;
