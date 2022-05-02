@@ -12,13 +12,13 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=1
 
 ## Run Test
 
-Run unit test and get raw output of LLVM-lit
+Run unit test and get raw output of LLVM-lit:
 ```shell
 cd build
 make check
 ```
 
-Run unit test and get analysis of the test result
+Run unit test and get analysis of the test result:
 ```shell
 cd build
 make check &> test.log
